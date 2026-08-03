@@ -149,11 +149,13 @@ so the Worker doesn't need an explicit `activity_executor`
 loop, which keeps the demo's worker setup a couple of lines shorter.
 
 - `generate_explanation.py`: `async def generate_explanation(...)` builds a
-  pydantic-ai `Agent` with an `OpenAIModel` + `OpenAIProvider`
+  pydantic-ai `Agent` with an `OpenAIChatModel` + `OpenAIProvider`
   (base_url=`OLLAMA_BASE_URL`, api_key="ollama") pointed at Ollama,
-  `output_type=InvestigationSummary`, called via `await agent.run(...)`. Prompt
-  includes `fraud_score` and `trigger_reason`, explicitly instructs the model to
-  *explain*, not *decide*.
+  `output_type=InvestigationSummary`, called via `await agent.run(...)` (result's
+  `.output` holds the `InvestigationSummary`). Prompt includes `fraud_score` and
+  `trigger_reason`, explicitly instructs the model to *explain*, not *decide*.
+  (Note: pydantic-ai 2.22.0 renamed the old `OpenAIModel` class to
+  `OpenAIChatModel` — verified against the installed wheel.)
 - `hold.py`: `place_hold(transaction_id)`, `release(transaction_id)`,
   `block(transaction_id)`, `escalate(transaction_id)` — each prints + sleeps.
 - `notify.py`: `notify_customer(customer_id, message, notification_type)` — prints
