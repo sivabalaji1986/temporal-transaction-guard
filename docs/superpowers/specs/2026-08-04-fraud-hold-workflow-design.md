@@ -93,6 +93,30 @@ from env (see `.env.example`):
 - `task_queue` (default `fraud-hold-task-queue`)
 - `fraud_score_threshold` (default `70`)
 
+### Pydantic data converter (required for every Temporal `Client`)
+
+Temporal's default data converter only knows how to serialize dataclasses and
+plain JSON-compatible types — it does not know how to serialize a Pydantic
+`BaseModel` (`Transaction`, `InvestigationSummary`, `CustomerResponse`) on its
+own. Every place a `temporalio.client.Client` is constructed
+(`app/main.py`, `app/worker.py`, `scripts/send_signal.py`, and the test file's
+`WorkflowEnvironment.start_time_skipping(...)`) must pass
+`data_converter=pydantic_data_converter` from
+`temporalio.contrib.pydantic`, e.g.:
+
+```python
+from temporalio.client import Client
+from temporalio.contrib.pydantic import pydantic_data_converter
+
+client = await Client.connect(
+    settings.temporal_address, data_converter=pydantic_data_converter
+)
+```
+
+Without this, passing the Pydantic models as workflow/activity/signal
+arguments will fail at runtime. (Verified against the `temporalio==1.31.0`
+wheel — `temporalio/contrib/pydantic.py`.)
+
 ## Workflow Logic (`app/workflows/fraud_hold_workflow.py`)
 
 Module docstring summarizes the full flow (as in Purpose above).
