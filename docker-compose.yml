@@ -1,0 +1,49 @@
+services:
+  temporal:
+    image: temporalio/temporal:1.8.2
+    command: server start-dev --ip 0.0.0.0
+    ports:
+      - "7233:7233"
+      - "8233:8233"
+    healthcheck:
+      # `temporal` is the same CLI binary running the server (it's this
+      # image's ENTRYPOINT), so it's available to re-invoke here against the
+      # server it's hosting. This only confirms the frontend service is
+      # accepting requests -- not that persistence or the namespace cache is
+      # fully warm -- but that's sufficient to gate api/worker startup.
+      test: ["CMD", "temporal", "operator", "cluster", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TASK_QUEUE=${TASK_QUEUE:-fraud-hold-task-queue}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1}
+      - FRAUD_SCORE_THRESHOLD=${FRAUD_SCORE_THRESHOLD:-70}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      temporal:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: python -m app.worker
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TASK_QUEUE=${TASK_QUEUE:-fraud-hold-task-queue}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1}
+      - FRAUD_SCORE_THRESHOLD=${FRAUD_SCORE_THRESHOLD:-70}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      temporal:
+        condition: service_healthy
