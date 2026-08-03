@@ -12,16 +12,38 @@ every external effect is mocked with a print statement and a short sleep.
 
 ## Stack
 
+All dependencies and images are pinned to their latest stable release as of
+2026-08-04, for reproducibility (this repo accompanies a published article).
+
 - Python 3.11+
-- Temporal Python SDK (`temporalio`), latest stable, unpinned
-- FastAPI (two endpoints only)
-- Pydantic models for all data passed between workflow/activities/API
-- pydantic-ai, using a local Ollama model via its OpenAI-compatible endpoint
-  (`OLLAMA_BASE_URL`, default `http://localhost:11434/v1`), model name from
-  `OLLAMA_MODEL` env var (default `llama3.1`)
-- Docker + docker-compose for: Temporal dev server (`temporalio/auto-setup`,
-  unpinned), the FastAPI app, and the worker. Ollama runs on the host; the worker
-  reaches it via `host.docker.internal`.
+- Temporal Python SDK: `temporalio==1.31.0`
+- FastAPI: `fastapi==0.141.1`, `uvicorn==0.52.1` (two endpoints only)
+- `pydantic==2.13.4` for all data passed between workflow/activities/API
+- `pydantic-settings==2.14.2` for env-driven config (separate package from
+  `pydantic` in Pydantic v2 — `BaseSettings` was moved out in v2)
+- `pydantic-ai==2.22.0`, using a local Ollama model via its OpenAI-compatible
+  endpoint (`OLLAMA_BASE_URL`, default `http://localhost:11434/v1`), model name
+  from `OLLAMA_MODEL` env var (default `llama3.1`)
+- Docker + docker-compose for: Temporal dev server
+  (`temporalio/auto-setup:1.29.7`), the FastAPI app, and the worker. Ollama runs
+  on the host; the worker reaches it via `host.docker.internal`.
+
+### `requirements.txt` (exact pins)
+
+```
+temporalio==1.31.0
+fastapi==0.141.1
+uvicorn==0.52.1
+pydantic==2.13.4
+pydantic-settings==2.14.2
+pydantic-ai==2.22.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+```
+
+(`pytest`/`pytest-asyncio` are for the Tests section below; `temporalio`'s test
+utilities, incl. `WorkflowEnvironment` and time-skipping, ship in the base
+package — no separate extra needed.)
 
 ## Folder Structure
 
@@ -39,12 +61,14 @@ temporal-transaction-guard/
 │   ├── workflows/
 │   │   └── fraud_hold_workflow.py
 │   └── activities/
-│       ├── investigate.py
+│       ├── generate_explanation.py
 │       ├── hold.py
 │       ├── notify.py
 │       └── log_outcome.py
-└── scripts/
-    └── send_signal.py
+├── scripts/
+│   └── send_signal.py
+└── tests/
+    └── test_fraud_hold_workflow.py
 ```
 
 ## Data Models (`app/models.py`)
@@ -59,7 +83,9 @@ temporal-transaction-guard/
 
 ## Config (`app/config.py`)
 
-Pydantic `BaseSettings` reading from env (see `.env.example`):
+`from pydantic_settings import BaseSettings` (the `pydantic-settings` package —
+`BaseSettings` was moved out of `pydantic` itself in Pydantic v2). Settings read
+from env (see `.env.example`):
 
 - `ollama_base_url` (default `http://localhost:11434/v1`)
 - `ollama_model` (default `llama3.1`)
@@ -81,37 +107,74 @@ Module docstring summarizes the full flow (as in Purpose above).
    for zero benefit and risk the two diverging.
 3. Below threshold: call `record_no_hold_outcome` activity, workflow completes.
 4. At/above threshold:
-   a. Call `investigate` activity → `InvestigationSummary`.
+   a. Call `generate_explanation` activity → `InvestigationSummary`. This is the
+      pydantic-ai / Ollama call — renamed from "investigate" because the agent's
+      job is to *explain* a decision already made in step 2, not to investigate
+      or re-decide fraud (consistent with the "AI explains, doesn't decide" rule
+      in Purpose).
    b. Call `place_hold` activity.
    c. Call `notify_customer` activity with the investigation's customer-facing
       explanation and notification type.
-   d. `workflow.wait_condition` on a signal flag, wrapped with
-      `asyncio.wait_for`-style Temporal timeout (24h) via
-      `workflow.wait_condition(..., timeout=timedelta(hours=24))`. Signal name:
-      `customer_responded`, payload is `CustomerResponse`.
-   e. Resolve:
+   d. Set up a `self._response: CustomerResponse | None = None` field, set by the
+      `customer_responded` signal handler. Wait with:
+      ```python
+      try:
+          await workflow.wait_condition(
+              lambda: self._response is not None,
+              timeout=timedelta(hours=24),
+          )
+      except asyncio.TimeoutError:
+          await workflow.execute_activity(
+              escalate, transaction.transaction_id,
+              start_to_close_timeout=timedelta(seconds=10),
+          )
+          return "escalated_no_response"
+      ```
+      `workflow.wait_condition`'s `timeout` param handles the 24h wait directly —
+      no separate `asyncio.wait_for` wrapping needed. `asyncio.TimeoutError` is
+      what it raises on expiry.
+   e. If the signal arrived before timeout, resolve:
       - `it_was_me` → `release` activity
       - `not_me` → `block` activity
-      - timeout (no signal) → `escalate` activity
-5. Workflow returns a short result dict/string describing the outcome (for
-   visibility in `workflow describe` / the Web UI).
+5. Workflow returns a short result string describing the outcome (for visibility
+   in `workflow describe` / the Web UI).
 
 ## Activities
 
-All activities are a handful of lines: a `print(...)` describing the mocked effect
-and `time.sleep(1)` (activities are sync, run in Temporal's default thread-pool
-executor).
+All activities are `async def`, using `await asyncio.sleep(1)` for the mocked
+delay, plus a `print(...)` describing the mocked effect. They're async (not sync)
+so the Worker doesn't need an explicit `activity_executor`
+(`ThreadPoolExecutor`) — the Temporal Python Worker only requires one for
+*synchronous* activities; async activities run directly on the asyncio event
+loop, which keeps the demo's worker setup a couple of lines shorter.
 
-- `investigate.py`: builds a pydantic-ai `Agent` with an `OpenAIModel` +
-  `OpenAIProvider`(base_url=`OLLAMA_BASE_URL`, api_key="ollama") pointed at Ollama,
-  `output_type=InvestigationSummary`. Prompt includes `fraud_score` and
-  `trigger_reason`, explicitly instructs the model to *explain*, not *decide*.
+- `generate_explanation.py`: `async def generate_explanation(...)` builds a
+  pydantic-ai `Agent` with an `OpenAIModel` + `OpenAIProvider`
+  (base_url=`OLLAMA_BASE_URL`, api_key="ollama") pointed at Ollama,
+  `output_type=InvestigationSummary`, called via `await agent.run(...)`. Prompt
+  includes `fraud_score` and `trigger_reason`, explicitly instructs the model to
+  *explain*, not *decide*.
 - `hold.py`: `place_hold(transaction_id)`, `release(transaction_id)`,
   `block(transaction_id)`, `escalate(transaction_id)` — each prints + sleeps.
 - `notify.py`: `notify_customer(customer_id, message, notification_type)` — prints
   + sleeps.
 - `log_outcome.py`: `record_no_hold_outcome(transaction_id, fraud_score)` — prints
   + sleeps.
+
+### Activity timeouts and retries
+
+Every `workflow.execute_activity(...)` call requires a `start_to_close_timeout`
+(the Temporal SDK raises at workflow-run time if it's missing). Since these are
+all mocked ~1-second effects, timeouts are generous but not unbounded:
+
+| Activity | `start_to_close_timeout` | Retry policy |
+|---|---|---|
+| `record_no_hold_outcome` | 10s | default (SDK's built-in retry) |
+| `generate_explanation` | 30s | explicit `RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=1))` — the LLM call is the one most likely to be flaky in a demo (local model, cold start), and it's a good, visible way to show Temporal's retry behavior in the Web UI |
+| `place_hold` | 10s | default |
+| `notify_customer` | 10s | default |
+| `release` / `block` | 10s | default |
+| `escalate` | 10s | default |
 
 ## FastAPI (`app/main.py`)
 
@@ -121,6 +184,18 @@ executor).
 - `POST /transactions/{transaction_id}/respond` — body: `CustomerResponse`.
   Gets a workflow handle by `transaction_id` and sends the `customer_responded`
   signal. Returns `{"status": "signal_sent"}`.
+
+### Duplicate transaction handling (idempotency)
+
+Using `transaction_id` as the Workflow ID is intentional — it's a natural
+idempotency key. If the fraud engine submits the same `transaction_id` twice
+(e.g. a retried webhook), the second `client.start_workflow(...)` call raises
+`temporalio.client.WorkflowAlreadyStartedError`. `POST /transactions/hold`
+catches that specific exception and returns the *existing* workflow's ID with
+`{"workflow_id": ..., "status": "already_started"}` instead of a 500. This is a
+deliberate demonstration of Temporal's dedup guarantee via Workflow ID, not an
+edge case being brushed aside — it's worth calling out explicitly since it's one
+of the more visible durable-execution properties in play.
 
 ## Worker (`app/worker.py`)
 
@@ -136,20 +211,45 @@ that signal delivery doesn't require going through the API.
 
 ## Docker Compose
 
-Three services: `temporal` (`temporalio/auto-setup`, exposes 7233 + 8233 UI),
-`api` (build from `Dockerfile`, runs uvicorn, port 8000, depends on `temporal`),
-`worker` (same image as `api`, runs `python -m app.worker`, depends on `temporal`).
-Both `api` and `worker` get `OLLAMA_BASE_URL=http://host.docker.internal:11434/v1`
-by default in `.env.example`, and `extra_hosts: host.docker.internal:host-gateway`
-for Linux Docker compatibility.
+Three services: `temporal` (`temporalio/auto-setup:1.29.7`, exposes 7233 + 8233
+UI), `api` (build from `Dockerfile`, runs uvicorn, port 8000, depends on
+`temporal`), `worker` (same image as `api`, runs `python -m app.worker`, depends
+on `temporal`). Both `api` and `worker` get
+`OLLAMA_BASE_URL=http://host.docker.internal:11434/v1` by default in
+`.env.example`, and `extra_hosts: host.docker.internal:host-gateway` for Linux
+Docker compatibility.
+
+## Tests
+
+A short test module (e.g. `tests/test_fraud_hold_workflow.py`) using Temporal's
+Python test framework — `temporalio.testing.WorkflowEnvironment` with
+time-skipping (`start_time_skipping()`) so the 24h timeout test doesn't actually
+wait 24 hours. All activities are mocked (no real Ollama call in tests). Exactly
+four cases, each short:
+
+1. **Below threshold** — `fraud_score=50` → workflow completes without calling
+   `place_hold`/`notify_customer`; `record_no_hold_outcome` was called.
+2. **`it_was_me`** — above threshold, send `customer_responded` signal with
+   `it_was_me` → `release` activity called, not `block`/`escalate`.
+3. **`not_me`** — above threshold, send signal with `not_me` → `block` activity
+   called.
+4. **Timeout → escalate** — above threshold, no signal sent, time-skip past 24h
+   → `escalate` activity called.
+
+This is meant to demonstrate the workflow is genuinely testable without a real
+Temporal server or LLM, not to be a full suite.
 
 ## Locked Decisions
 
 - Fraud score threshold: **70**.
-- Temporal SDK / dev-server image: current stable / latest, unpinned.
+- Dependency/image pins: `temporalio==1.31.0`, `fastapi==0.141.1`,
+  `uvicorn==0.52.1`, `pydantic==2.13.4`, `pydantic-settings==2.14.2`,
+  `pydantic-ai==2.22.0`, `temporalio/auto-setup:1.29.7` — all latest stable as
+  of 2026-08-04.
 
 ## Out of Scope
 
-No database, no auth, no tests beyond what's trivial to include, no real
-payment/notification integrations. README already documents the run/demo steps;
-this spec does not duplicate them.
+No database, no auth, no real payment/notification integrations. The four
+workflow tests above are the extent of test coverage — no API-layer or
+activity-internals tests. README already documents the run/demo steps; this
+spec does not duplicate them.
