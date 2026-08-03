@@ -24,9 +24,9 @@ All dependencies and images are pinned to their latest stable release as of
 - `pydantic-ai==2.22.0`, using a local Ollama model via its OpenAI-compatible
   endpoint (`OLLAMA_BASE_URL`, default `http://localhost:11434/v1`), model name
   from `OLLAMA_MODEL` env var (default `llama3.1`)
-- Docker + docker-compose for: Temporal dev server
-  (`temporalio/auto-setup:1.29.7`), the FastAPI app, and the worker. Ollama runs
-  on the host; the worker reaches it via `host.docker.internal`.
+- Docker + docker-compose for: Temporal dev server (`temporalio/temporal:1.8.2`,
+  running `temporal server start-dev`), the FastAPI app, and the worker. Ollama
+  runs on the host; the worker reaches it via `host.docker.internal`.
 
 ### `requirements.txt` (exact pins)
 
@@ -190,8 +190,12 @@ all mocked ~1-second effects, timeouts are generous but not unbounded:
 Using `transaction_id` as the Workflow ID is intentional — it's a natural
 idempotency key. If the fraud engine submits the same `transaction_id` twice
 (e.g. a retried webhook), the second `client.start_workflow(...)` call raises
-`temporalio.client.WorkflowAlreadyStartedError`. `POST /transactions/hold`
-catches that specific exception and returns the *existing* workflow's ID with
+`WorkflowAlreadyStartedError`, imported as
+`from temporalio.exceptions import WorkflowAlreadyStartedError` (this is where
+the SDK defines it — `temporalio.client` only references it, it doesn't
+re-export it, so importing it from `temporalio.client` fails).
+`POST /transactions/hold` catches that specific exception and returns the
+*existing* workflow's ID with
 `{"workflow_id": ..., "status": "already_started"}` instead of a 500. This is a
 deliberate demonstration of Temporal's dedup guarantee via Workflow ID, not an
 edge case being brushed aside — it's worth calling out explicitly since it's one
@@ -211,13 +215,22 @@ that signal delivery doesn't require going through the API.
 
 ## Docker Compose
 
-Three services: `temporal` (`temporalio/auto-setup:1.29.7`, exposes 7233 + 8233
-UI), `api` (build from `Dockerfile`, runs uvicorn, port 8000, depends on
-`temporal`), `worker` (same image as `api`, runs `python -m app.worker`, depends
-on `temporal`). Both `api` and `worker` get
-`OLLAMA_BASE_URL=http://host.docker.internal:11434/v1` by default in
-`.env.example`, and `extra_hosts: host.docker.internal:host-gateway` for Linux
-Docker compatibility.
+Three services: `temporal` (`temporalio/temporal:1.8.2`, running
+`temporal server start-dev --ip 0.0.0.0`, exposes 7233 + 8233 UI), `api` (build
+from `Dockerfile`, runs uvicorn, port 8000, depends on `temporal`), `worker`
+(same image as `api`, runs `python -m app.worker`, depends on `temporal`). Both
+`api` and `worker` get `OLLAMA_BASE_URL=http://host.docker.internal:11434/v1`
+by default in `.env.example`, and `extra_hosts: host.docker.internal:host-gateway`
+for Linux Docker compatibility.
+
+`temporalio/temporal` is the Temporal CLI image — `temporal server start-dev`
+bundles the server and the Web UI in one process/container, both listening
+where the CLI's dev-server normally puts them (7233 for the frontend service,
+8233 for the Web UI). This replaces the earlier `temporalio/auto-setup` choice:
+`auto-setup` only runs the server against a preconfigured database and does
+**not** ship the Web UI — getting the UI that way would need a second
+`temporalio/ui` container. Using the CLI dev-server image instead keeps this
+demo to a single Temporal container.
 
 ## Tests
 
@@ -244,7 +257,7 @@ Temporal server or LLM, not to be a full suite.
 - Fraud score threshold: **70**.
 - Dependency/image pins: `temporalio==1.31.0`, `fastapi==0.141.1`,
   `uvicorn==0.52.1`, `pydantic==2.13.4`, `pydantic-settings==2.14.2`,
-  `pydantic-ai==2.22.0`, `temporalio/auto-setup:1.29.7` — all latest stable as
+  `pydantic-ai==2.22.0`, `temporalio/temporal:1.8.2` — all latest stable as
   of 2026-08-04.
 
 ## Out of Scope
