@@ -18,7 +18,9 @@ Reference spec: `docs/superpowers/specs/2026-08-04-fraud-hold-workflow-design.md
 - Every activity is `async def`, using `await asyncio.sleep(1)` plus a `print(...)` for its mocked effect. No `activity_executor` is configured on the Worker — this only works because every activity is async.
 - Every `workflow.execute_activity(...)` call must pass `start_to_close_timeout`; `generate_explanation` additionally gets `RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=1))`.
 - Every `temporalio.client.Client` (in `main.py`, `worker.py`, `scripts/send_signal.py`, and the test file's `WorkflowEnvironment.start_time_skipping(...)`) must pass `data_converter=pydantic_data_converter` from `temporalio.contrib.pydantic`, or Pydantic models fail to serialize across the workflow boundary.
-- Catch `WorkflowAlreadyStartedError` from `temporalio.exceptions` (not `temporalio.client`) in the hold endpoint.
+- Catch `WorkflowAlreadyStartedError` from `temporalio.exceptions` (not `temporalio.client`) in the hold endpoint. Pass `id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE` (from `temporalio.common`) on `start_workflow` so a duplicate `transaction_id` is rejected the same way whether the original execution is still running or has already completed — the default `ALLOW_DUPLICATE` only catches the former.
+- In the above-threshold branch, `place_hold` runs **before** `generate_explanation`: the hold protects funds and must not depend on the LLM call succeeding or being fast.
+- The Docker crash-resume demo (Task 10) proves the *workflow's* durable progress and correct replay — not exactly-once *activity* execution. Activities are at-least-once; a real (non-mocked) hold/release/block integration must be idempotent on its own (e.g. keyed by `transaction_id`).
 - `investigate` is named `generate_explanation` everywhere (file, function, activity name) — the agent explains a decision already made, it does not re-decide.
 - **No tests beyond the four workflow tests** specified in Task 6 (below-threshold, it_was_me, not_me, timeout→escalate). Do not add tests for models, config, individual activities, or the FastAPI layer — verify those manually (a `python -c` snippet, `docker compose config`, or `curl`), per the spec's explicit scope limit.
 - No database, no auth, no real payment/notification integrations — every activity's "effect" is a print statement and a sleep.
@@ -128,6 +130,17 @@ services:
     ports:
       - "7233:7233"
       - "8233:8233"
+    healthcheck:
+      # `temporal` is the same CLI binary running the server (it's this
+      # image's ENTRYPOINT), so it's available to re-invoke here against the
+      # server it's hosting. This only confirms the frontend service is
+      # accepting requests -- not that persistence or the namespace cache is
+      # fully warm -- but that's sufficient to gate api/worker startup.
+      test: ["CMD", "temporal", "operator", "cluster", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   api:
     build: .
@@ -142,7 +155,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      - temporal
+      temporal:
+        condition: service_healthy
 
   worker:
     build: .
@@ -156,7 +170,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      - temporal
+      temporal:
+        condition: service_healthy
 ```
 
 - [ ] **Step 5: Create the empty package init files**
@@ -609,6 +624,9 @@ async def test_it_was_me_releases():
     assert "release" in calls
     assert "block" not in calls
     assert "escalate" not in calls
+    # place_hold must happen before generate_explanation: the hold protects
+    # funds and must not depend on the LLM call succeeding or being fast.
+    assert calls.index("place_hold") < calls.index("generate_explanation")
 
 
 @pytest.mark.asyncio
@@ -639,6 +657,9 @@ async def test_not_me_blocks():
     assert "block" in calls
     assert "release" not in calls
     assert "escalate" not in calls
+    # place_hold must happen before generate_explanation: the hold protects
+    # funds and must not depend on the LLM call succeeding or being fast.
+    assert calls.index("place_hold") < calls.index("generate_explanation")
 
 
 @pytest.mark.asyncio
@@ -677,13 +698,14 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'app.workflows.fraud_ho
 ```python
 """FraudHoldWorkflow orchestrates what happens after an existing fraud engine
 flags a transaction: a deterministic score check decides whether to place a
-hold; if held, a pydantic-ai agent (via a local Ollama model) generates a
-customer-facing explanation and an internal ops summary, the transaction is
-held and the customer notified, and the workflow durably waits up to 24 hours
-for the customer's "it was me" / "not me" response -- resolving to release,
-block, or escalate on timeout. Because Temporal persists workflow progress
-independently of the worker process, this all resumes correctly even if the
-worker is killed and restarted mid-hold.
+hold; if held, the transaction is held immediately (so fund protection never
+waits on the LLM), then a pydantic-ai agent (via a local Ollama model)
+generates a customer-facing explanation and an internal ops summary, the
+customer is notified, and the workflow durably waits up to 24 hours for the
+customer's "it was me" / "not me" response -- resolving to release, block, or
+escalate on timeout. Because Temporal persists workflow progress independently
+of the worker process, this all resumes correctly even if the worker is
+killed and restarted mid-hold.
 """
 
 import asyncio
@@ -727,6 +749,17 @@ class FraudHoldWorkflow:
             )
             return "no_hold_needed"
 
+        # Place the hold before generating the LLM explanation: the hold is
+        # what actually protects funds, and that protection shouldn't depend
+        # on Ollama being reachable. If the explanation call is slow or
+        # fails, the hold is already in place; only the customer-facing
+        # explanation and notification are delayed.
+        await workflow.execute_activity(
+            place_hold,
+            transaction.transaction_id,
+            start_to_close_timeout=timedelta(seconds=10),
+        )
+
         investigation: InvestigationSummary = await workflow.execute_activity(
             generate_explanation,
             args=[transaction.fraud_score, transaction.trigger_reason],
@@ -734,12 +767,6 @@ class FraudHoldWorkflow:
             retry_policy=RetryPolicy(
                 maximum_attempts=3, initial_interval=timedelta(seconds=1)
             ),
-        )
-
-        await workflow.execute_activity(
-            place_hold,
-            transaction.transaction_id,
-            start_to_close_timeout=timedelta(seconds=10),
         )
 
         await workflow.execute_activity(
@@ -890,6 +917,7 @@ from typing import Optional
 
 from fastapi import FastAPI
 from temporalio.client import Client
+from temporalio.common import WorkflowIDReusePolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
@@ -921,15 +949,25 @@ async def hold_transaction(transaction: Transaction) -> dict:
             args=[transaction, settings.fraud_score_threshold],
             id=transaction.transaction_id,
             task_queue=settings.task_queue,
+            # REJECT_DUPLICATE governs closed (completed) workflows with this
+            # ID: without it, the default (ALLOW_DUPLICATE) would let a
+            # retried submission silently start a brand-new execution once
+            # the original has already finished, defeating the idempotency
+            # this endpoint is meant to provide. The default id_conflict_policy
+            # already rejects starting over a *currently running* execution
+            # with the same ID (raising the same WorkflowAlreadyStartedError
+            # caught below) -- this policy covers the other half: a duplicate
+            # submitted after the original has already completed.
+            id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
         )
         return {"workflow_id": handle.id, "status": "started"}
     except WorkflowAlreadyStartedError:
         # transaction_id is used as the Workflow ID on purpose -- it's a
-        # natural idempotency key. If the fraud engine (or a client retry)
-        # submits the same transaction_id twice, this returns the existing
-        # workflow's ID instead of erroring, demonstrating Temporal's
-        # dedup-by-Workflow-ID guarantee rather than treating it as an
-        # edge case to reject.
+        # natural idempotency key. Whether the duplicate was submitted while
+        # the original is still running or after it already completed, this
+        # returns the existing workflow's ID instead of erroring,
+        # demonstrating Temporal's dedup-by-Workflow-ID guarantee rather than
+        # treating it as an edge case to reject.
         return {"workflow_id": transaction.transaction_id, "status": "already_started"}
 
 
@@ -941,7 +979,7 @@ async def respond_to_transaction(transaction_id: str, response: CustomerResponse
     return {"status": "signal_sent"}
 ```
 
-- [ ] **Step 2: Verify manually (requires a local Temporal dev server and worker running)**
+- [ ] **Step 2: Verify manually — duplicate submission while the workflow is still running**
 
 ```bash
 temporal server start-dev &
@@ -951,22 +989,42 @@ sleep 2
 uvicorn app.main:app --port 8000 &
 sleep 2
 
+# fraud_score=90 is above threshold, so this workflow stays running (waiting
+# on the signal) instead of completing immediately.
 curl -s -X POST http://localhost:8000/transactions/hold \
   -H "Content-Type: application/json" \
-  -d '{"transactionId": "TXN-2001", "fraudScore": 40, "triggerReason": "TEST", "customerId": "CUST-1"}'
+  -d '{"transactionId": "TXN-2001", "fraudScore": 90, "triggerReason": "TEST", "customerId": "CUST-1"}'
 echo
-# repeat the same request to exercise the idempotency path
+sleep 2
+# repeat immediately, while the first execution is still running
 curl -s -X POST http://localhost:8000/transactions/hold \
   -H "Content-Type: application/json" \
-  -d '{"transactionId": "TXN-2001", "fraudScore": 40, "triggerReason": "TEST", "customerId": "CUST-1"}'
+  -d '{"transactionId": "TXN-2001", "fraudScore": 90, "triggerReason": "TEST", "customerId": "CUST-1"}'
+echo
+```
+
+Expected: first curl returns `{"workflow_id":"TXN-2001","status":"started"}`; second returns `{"workflow_id":"TXN-2001","status":"already_started"}` — this exercises the default `id_conflict_policy` path (a currently-running execution with the same ID).
+
+- [ ] **Step 3: Verify manually — duplicate submission after the workflow has already completed**
+
+```bash
+curl -s -X POST http://localhost:8000/transactions/TXN-2001/respond \
+  -H "Content-Type: application/json" \
+  -d '{"response": "it_was_me"}'
+echo
+sleep 2
+# TXN-2001's workflow has now completed. Submit the same transaction_id again.
+curl -s -X POST http://localhost:8000/transactions/hold \
+  -H "Content-Type: application/json" \
+  -d '{"transactionId": "TXN-2001", "fraudScore": 90, "triggerReason": "TEST", "customerId": "CUST-1"}'
 echo
 
 kill %3 %2 %1 2>/dev/null
 ```
 
-Expected: first curl returns `{"workflow_id":"TXN-2001","status":"started"}`; second returns `{"workflow_id":"TXN-2001","status":"already_started"}` (since `fraud_score=40` is below the threshold, the workflow completes almost immediately either way, but the ID reuse behavior is what this step is checking).
+Expected: `{"workflow_id":"TXN-2001","status":"already_started"}` — this exercises the `id_reuse_policy=REJECT_DUPLICATE` path (a *closed* execution with the same ID). Without that policy, this call would instead return `{"status":"started"}` and silently start a second, unrelated execution reusing the same Workflow ID.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add app/main.py
@@ -1060,11 +1118,11 @@ git commit -m "Add standalone script to simulate a customer's signal response"
 
 ```bash
 docker compose up --build -d
-sleep 5
+sleep 15
 docker compose ps
 ```
 
-Expected: `temporal`, `api`, `worker` all show as running/healthy.
+Expected: `temporal` shows status `healthy` (via its `temporal operator cluster health` healthcheck); `api` and `worker` show as running, and only started polling/serving once `temporal` reported healthy (that's what `depends_on: condition: service_healthy` enforces) — so their logs should show no initial connection-refused errors against `temporal:7233`.
 
 - [ ] **Step 2: Trigger a hold-worthy transaction**
 
@@ -1093,7 +1151,7 @@ docker compose logs worker --tail 20
 
 Expected: no errors in the fresh worker's logs; the workflow is still visible as running in the Web UI (its history was persisted by the Temporal server, independent of the worker process).
 
-- [ ] **Step 5: Resolve the case and confirm exactly-once execution**
+- [ ] **Step 5: Resolve the case and confirm successful, idempotent resolution after restart**
 
 ```bash
 curl -s -X POST http://localhost:8000/transactions/TXN-DEMO-1/respond \
@@ -1104,6 +1162,8 @@ docker compose logs worker --tail 20
 ```
 
 Expected: `{"status":"signal_sent"}`; the worker's logs show exactly one `[hold] releasing hold on TXN-DEMO-1...` line (not duplicated), and the Web UI shows the workflow as completed with result `"released"`.
+
+Note on what this actually proves: Temporal guarantees the *workflow's* durable progress and correct replay from history — it does not give the *activities* exactly-once execution. Activities have at-least-once semantics (they can retry after a timeout or a worker crash mid-execution, potentially running again). This demo's activities are safe to see printed more than once because they're mocked no-ops; a real (non-mocked) hold/release/block integration must be idempotent in its own right — typically by using `transaction_id` as an idempotency key against the downstream system — since Temporal will not deduplicate an activity that legitimately retries.
 
 - [ ] **Step 6: Tear down**
 
@@ -1120,3 +1180,5 @@ No commit for this task — it's verification of already-committed work.
 - **Spec coverage:** every spec section maps to a task — scaffolding/pins (Task 1), models (Task 2), config (Task 3), mocked activities (Task 4), `generate_explanation` (Task 5), workflow + the exact 4 tests (Task 6), worker (Task 7), FastAPI + idempotency (Task 8), `send_signal.py` (Task 9), docker-compose crash-resume demo (Task 10).
 - **Type consistency checked:** `Transaction`/`InvestigationSummary`/`CustomerResponse` field names match between Task 2's definition and every later task's usage (`transaction.fraud_score`, `investigation.customer_explanation`, `investigation.notification_type`, `response.response`). Activity function names (`record_no_hold_outcome`, `generate_explanation`, `place_hold`, `release`, `block`, `escalate`, `notify_customer`) match between Tasks 4/5's definitions, Task 6's workflow imports and mock-test names, and Task 7's worker registration list.
 - **No placeholders:** every step has complete, runnable code — no TODOs.
+- **Forward-dependency check (found and fixed):** Task 8's original "duplicate after completion" verification called `scripts/send_signal.py`, which doesn't exist until Task 9. Fixed to use the `/transactions/{id}/respond` endpoint Task 8 already defines, so each task's verification only depends on earlier tasks.
+- **Ordering consistency:** Task 6's workflow code, docstring, and the two order-sensitive test assertions (`test_it_was_me_releases`, `test_not_me_blocks`) all now agree that `place_hold` runs before `generate_explanation`.
