@@ -4,7 +4,7 @@
 
 **Goal:** Build `temporal-transaction-guard` — a minimal, readable Python demo of Temporal's durable execution applied to a banking fraud-hold scenario (explain → hold → notify → wait → resolve).
 
-**Architecture:** A FastAPI app starts a Temporal workflow per transaction. The workflow does a deterministic threshold check, then (if above threshold) places the hold, calls a pydantic-ai/Ollama activity to generate customer/ops explanations, notifies the customer, and durably waits up to 24h for a `customer_responded` signal before resolving to release/block/escalate. A separate worker process executes the workflow and all activities; killing and restarting it mid-hold must not lose or duplicate any side effect.
+**Architecture:** A FastAPI app starts a Temporal workflow per transaction. The workflow does a deterministic threshold check, then (if above threshold) places the hold, calls a pydantic-ai/Ollama activity to generate customer/ops explanations, notifies the customer, and durably waits up to 24h for a `customer_responded` signal before resolving to release/block/escalate. A separate worker process executes the workflow and all activities; killing and restarting it mid-hold must preserve the workflow's progress and rely on idempotent activities to avoid duplicate real-world side effects.
 
 **Tech Stack:** Python 3.11+, `temporalio` 1.31.0, FastAPI 0.141.1 + uvicorn 0.52.1, `pydantic` 2.13.4, `pydantic-settings` 2.14.2, `pydantic-ai` 2.22.0 (via Ollama's OpenAI-compatible endpoint), Docker + docker-compose (`temporalio/temporal:1.8.2` dev-server image).
 
