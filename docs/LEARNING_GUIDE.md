@@ -27,7 +27,23 @@ Before looking at a single line of code, here's the story of what happens, in pl
 
 8. **The workflow resolves the case** — back in `hold.py` again — either releasing the hold ("it was me"), blocking it ("not me"), or escalating it for manual review (the 24-hour timeout fired with no reply).
 
-That's the whole system. Now let's go file by file and see how each piece of this is actually written.
+That's the whole system. Before diving into each file in detail, here's a quick-scan reference table — not a replacement for the walkthrough that follows, just something to glance back at while you're in it:
+
+| File | Role | Flow step(s) |
+|---|---|---|
+| `app/models.py` | Data model | Defines the shapes used at every step |
+| `app/config.py` | Configuration | Supplies settings used in steps 2, 4, 6 |
+| `app/activities/log_outcome.py` | Activity | Below-threshold outcome (alternative to step 4) |
+| `app/activities/hold.py` | Activity | Place hold, release, block, escalate (steps 4, 8) |
+| `app/activities/notify.py` | Activity | Notify customer (step 4) |
+| `app/activities/generate_explanation.py` | Activity | Generate AI explanation (step 4) |
+| `app/workflows/fraud_hold_workflow.py` | Workflow orchestration | Threshold check, activity calls, wait, resolve (steps 2–8) |
+| `app/worker.py` | Worker entrypoint | Actually executes the workflow + activities (step 6) |
+| `app/main.py` | FastAPI endpoints | Request in (steps 1–2), Signal in (step 7) |
+| `scripts/send_signal.py` | Standalone script | Signal in — an alternative path for step 7 |
+| `tests/test_fraud_hold_workflow.py` | Test | Exercises steps 2–8 without a real server or AI |
+
+Now let's go file by file and see how each piece of this is actually written.
 
 ---
 
@@ -66,9 +82,9 @@ class CustomerResponse(BaseModel):
 
 **New concepts, explained:**
 
-- **`import`** — the first line, `from typing import Literal`, is Python's way of saying "I want to use some code that lives in another file/library." `typing` and `pydantic` aren't part of this project — they're external libraries this project depends on (see `requirements.txt`).
+- **`import`** — the first line, `from typing import Literal`, is Python's way of saying "I want to use some code that lives in another file/library." `typing` is part of Python's **standard library** — it ships with Python itself, nothing to install. `pydantic`, imported on the next line, is different: it's an **external library** — a separate package this project depends on and has to install (see `requirements.txt`). (Coming from Java: a Python *module* — one `.py` file, like this one — is roughly analogous to a single Java source file, and `import` here plays a similar role to Java's `import`.)
 - **`class`** — a class is a blueprint for a "thing" that bundles data together. `class Transaction(BaseModel):` says "here's a new kind of thing called `Transaction`, and it works like Pydantic's `BaseModel`." Once defined, you can create an actual `Transaction` by calling it like a function: `Transaction(transaction_id="TXN-1", ...)`.
-- **`BaseModel` (Pydantic)** — this is the one external concept worth understanding early, because it's used everywhere in this project. A Pydantic `BaseModel` is a class where you declare the fields you expect (with their types), and Pydantic automatically: validates incoming data matches those types, converts JSON into real Python objects and back, and raises a clear error if something doesn't fit. Every "shape of data" in this project (`Transaction`, `InvestigationSummary`, `CustomerResponse`) is a Pydantic model for exactly this reason.
+- **`BaseModel` (Pydantic)** — this is the one external concept worth understanding early, because it's used everywhere in this project. A Pydantic `BaseModel` is a class where you declare the fields you expect (with their types), and Pydantic automatically: validates incoming data matches those types, converts JSON into real Python objects and back, and raises a clear error if something doesn't fit. Every "shape of data" in this project (`Transaction`, `InvestigationSummary`, `CustomerResponse`) is a Pydantic model for exactly this reason. (If you know Java: think of a Pydantic `BaseModel` as roughly a DTO or record, but with the validation logic built in, rather than hand-written or bolted on with a separate library.)
 - **Type hints** — `transaction_id: str` means "this field is expected to be a string." `fraud_score: float` means a decimal number. These aren't just documentation — Pydantic actually *enforces* them at runtime (if you tried to create a `Transaction` with `fraud_score="not a number"`, it would raise an error).
 - **`Literal["sms", "email", "push"]`** — this is a type hint that means "not just any string — specifically one of these exact values." `InvestigationSummary.notification_type` can only ever be `"sms"`, `"email"`, or `"push"`; anything else is rejected.
 - **`Field(alias="transactionId")`** — the fraud engine that calls our API sends JSON with camelCase keys (`transactionId`, `fraudScore`), but Python convention is snake_case (`transaction_id`, `fraud_score`). `alias=` tells Pydantic "when reading JSON, look for this key instead of the field's Python name." `model_config = ConfigDict(populate_by_name=True)` additionally allows constructing a `Transaction` using the Python names directly (useful in tests — see Section 2.11), not just the aliases.
@@ -134,8 +150,8 @@ async def record_no_hold_outcome(transaction_id: str, fraud_score: float) -> Non
 
 **New concepts, explained:**
 
-- **Decorators (`@activity.defn`)** — a decorator is a line starting with `@`, placed directly above a function, that *wraps* that function to add extra behavior without changing the function's own code. Here, `@activity.defn` doesn't change what `record_no_hold_outcome` does when you call it directly — it registers the function with Temporal's SDK as something Temporal is *allowed to run as an Activity*. Without this decorator, Temporal has no way of knowing this function exists.
-- **`async def` / `await`** — `async def` marks a function as *asynchronous*: it's allowed to pause partway through (at an `await`) and let other work happen, instead of blocking everything until it finishes. `await asyncio.sleep(1)` pauses this specific function for 1 second without freezing the rest of the program. You can only use `await` inside a function defined with `async def`. Temporal activities and workflows in this project are always written as `async def` — this lets a single worker process handle many activities "at once" (really: taking turns whenever one of them is waiting on something, like a sleep or a network call).
+- **Decorators (`@activity.defn`)** — a decorator is a line starting with `@`, placed directly above a function, that *wraps* that function to add extra behavior without changing the function's own code. Here, `@activity.defn` doesn't change what `record_no_hold_outcome` does when you call it directly — it marks the function as *eligible* to be run as a Temporal Activity (attaching the metadata Temporal needs to recognize it as one, like its name). That's only half the story, though: `@activity.defn` by itself does **not** register this function with any actual running Worker — a decorated function that no `Worker` ever loads still can't be executed by Temporal. The second, separate step — actually making a Worker able to run it — happens in `app/worker.py`, when the function is explicitly included in that `Worker`'s `activities=[...]` list (Section 2.8). Both steps are required: `@activity.defn` here, *and* being listed in a `Worker` there. (If you know Java: a decorator is similar in spirit to an annotation like `@Override` or `@Transactional` — a marker on a piece of code that some other framework logic looks for and acts on. The difference is where that "acting" happens: `@activity.defn`'s registration-eligibility logic runs immediately, but the "actually able to run it" part still needs the separate `Worker` step above — there's no single annotation here that does everything Spring's `@Transactional` might do in one place.)
+- **`async def` / `await`** — `async def` marks a function as *asynchronous*: it's allowed to pause partway through (at an `await`) and let other work happen, instead of blocking everything until it finishes. `await asyncio.sleep(1)` pauses this specific function for 1 second without freezing the rest of the program. You can only use `await` inside a function defined with `async def`. Temporal activities and workflows in this project are always written as `async def` — this lets a single worker process handle many activities "at once" (really: taking turns whenever one of them is waiting on something, like a sleep or a network call). (If you know Java: this is a rough analogue to chaining `CompletableFuture`s — both let one thread juggle multiple pending operations instead of blocking on each one — but it's an approximation, not an exact match; Python's `async`/`await` reads more like ordinary sequential code, with the pause points made explicit by `await`.)
 - **`-> None`** — a type hint on the *return value* this time, meaning "this function doesn't return anything meaningful."
 - **f-strings (`f"..."`)** — the `f` right before a string means you can drop variables directly inside it using `{curly braces}`, e.g. `f"...{transaction_id}..."` inserts the actual value of `transaction_id` into the text.
 
@@ -258,6 +274,7 @@ async def generate_explanation(fraud_score: float, trigger_reason: str) -> Inves
 - **`OpenAIChatModel` + `OpenAIProvider`** — Ollama exposes an API that's compatible with OpenAI's own API format, so PydanticAI can talk to it using its "OpenAI" support, just pointed at a different `base_url` (Ollama's local address instead of OpenAI's servers) with a throwaway `api_key` (Ollama doesn't check it).
 - **`await _agent.run(...)`** — actually sends the prompt and waits for (and validates) the response. `result.output` is the resulting `InvestigationSummary` object.
 - Notice this function returns `InvestigationSummary`, not `None` like every activity so far — activities can return real data, and Temporal will deliver that return value back to whatever workflow code called it (we'll see this land in a variable in Section 2.7).
+- **What happens to `ops_summary`?** The AI agent generates all three `InvestigationSummary` fields, including `ops_summary`, and it's genuinely present in this activity's result. But if you follow it forward into Section 2.7, you'll see the workflow only ever reads `investigation.customer_explanation` and `investigation.notification_type` when calling `notify_customer` — `ops_summary` isn't passed anywhere further in this demo. It exists as a hook for a future audit-log or internal-ops integration, not because anything in this project currently reads it.
 
 **Calls out to:** `app/config.py` (for the Ollama URL/model), `app/models.py` (for the `InvestigationSummary` shape); PydanticAI/Ollama externally.
 **Called by:** `fraud_hold_workflow.py`, `worker.py`.
@@ -270,7 +287,7 @@ async def generate_explanation(fraud_score: float, trigger_reason: str) -> Inves
 
 **Job:** This is the file that orchestrates everything — it's the "recipe" that decides, in order, which activities to call and when to pause. This is the most important file in the project, so we'll go through it carefully.
 
-**What's a "Workflow," and how is it different from an "Activity"?** A Workflow is the *orchestration* logic — the sequence of decisions and activity calls. Temporal records everything a workflow does as a history of events on its own server. If the worker process that's running a workflow dies, a new worker can pick that history back up and continue exactly where it left off, by **replaying** the workflow's code against the recorded history (fast-forwarding through what already happened, without re-doing it) until it catches up to the present. This is *why* the workflow's own code has a strict rule: it must be **deterministic** — given the same history, it must make the exact same decisions every time it's replayed. That's why anything unpredictable (calling an AI model, reading the current time, random numbers) is pushed out into an Activity instead, and the workflow only ever contains plain, predictable logic plus calls out to activities.
+**What's a "Workflow," and how is it different from an "Activity"?** A Workflow is the *orchestration* logic — the sequence of decisions and activity calls. Temporal records everything a workflow does as a history of events on its own server. If the worker process that's running a workflow dies, a new worker can pick that history back up and continue exactly where it left off, by **replaying** the workflow's code against that recorded history: instead of actually re-executing already-completed activities, it just feeds back their already-recorded results instantly, fast-forwarding until it reaches the exact point where it left off — then continues normally from there. This is *why* the workflow's own code has a strict rule: it must be **deterministic** — given the same history, it must make the exact same decisions every time it's replayed. That's why anything unpredictable (calling an AI model, reading the current time, random numbers) is pushed out into an Activity instead, and the workflow only ever contains plain, predictable logic plus calls out to activities.
 
 Let's look at the imports first:
 
@@ -717,7 +734,7 @@ async def test_it_was_me_releases():
 
 ### 2.12 The `__init__.py` files
 
-`app/__init__.py`, `app/activities/__init__.py`, `app/workflows/__init__.py`, and `scripts/__init__.py` are all completely empty. Their only job is to tell Python "treat this folder as a package" — a collection of importable modules — which is what makes writing `from app.activities.hold import place_hold` (instead of some more awkward path-based import) possible throughout this project. There's nothing to read inside them.
+`app/__init__.py`, `app/activities/__init__.py`, `app/workflows/__init__.py`, and `scripts/__init__.py` are all completely empty. Their only job is to tell Python "treat this folder as a package" — a collection of importable modules — which is what makes writing `from app.activities.hold import place_hold` (instead of some more awkward path-based import) possible throughout this project. There's nothing to read inside them. (If you know Java: a Python package — a folder containing an `__init__.py` — plays roughly the same organizing role as a Java package, and `app.activities.hold` reads much like a Java package path such as `app.activities.hold`, just with dots instead of matching directory-and-namespace declarations.)
 
 ---
 
@@ -849,3 +866,15 @@ Now, the five tests themselves:
 **Asserts:** the result is still `"released"`; `"generate_explanation"` did run (it wasn't skipped — it was attempted and failed); `"notify_customer"` still ran; and, most specifically, the actual message captured in `notify_messages` is **not** the AI mock's normal success text (`"test explanation"`) and **does** contain `"temporarily paused"` — the exact fallback wording from `fraud_hold_workflow.py`.
 
 **What it proves:** this is the automated proof for Section 4.5 — that a total, repeated AI failure doesn't crash the workflow or leave the hold stuck, and that the customer genuinely receives the fallback message (not just that *some* message was sent).
+
+---
+
+## If you want to read this in stages
+
+Everything in this guide is worth reading eventually — nothing here is filler. But if a full first pass feels like a lot in one sitting, here's one way to split it into a couple of visits rather than trying to absorb it all at once:
+
+- **A first pass**, to get oriented: Section 1 (the big picture), the quick-reference table right after it, and Section 2's entries for `models.py`, the activity files (2.3–2.6), and `fraud_hold_workflow.py` (2.7) — that's enough to understand what the system does and how the core orchestration is written.
+- **A second pass**, to see it all connect: the rest of Section 2 (`worker.py`, `main.py`, `send_signal.py`, the tests), then Section 3's two traced-through scenarios — by this point the file-by-file pieces should click into a single mental model of a request's full journey.
+- **A third pass**, to consolidate: Section 4 (where each durability concept actually lives in the code) and Section 5 (what each test proves) — these two sections mostly point back at code you've already read, tying it to the specific Temporal concepts and correctness guarantees it demonstrates.
+
+Come back to any earlier section as needed — the file-by-file walkthrough in particular is meant to double as a reference, not just a one-time read.
