@@ -23,9 +23,10 @@ Existing fraud engine flags transaction
         |
         v
 POST /transactions/hold  (FastAPI)
-        |
-        v
-FastAPI starts FraudHoldWorkflow  (Temporal client call)
+        |                              <- resubmitting the same transaction_id
+        v                                 (still running OR already completed)
+FastAPI starts FraudHoldWorkflow          returns {"status": "already_started"}
+(Temporal client call)                    instead of starting a duplicate
         |
         v
 Deterministic threshold check          <- pure workflow logic, NOT an activity
@@ -45,6 +46,10 @@ Record no-hold outcome              Place temporary hold (Activity)
                                      - operations summary
                                      - notification content
                                      (Activity, calls local Ollama model)
+                                     <- falls back to a fixed, deterministic
+                                        explanation instead of failing the
+                                        workflow if this fails after retries
+                                        (e.g. Ollama is unreachable)
                                                 |
                                                 v
                                      Notify customer (Activity)
@@ -52,6 +57,9 @@ Record no-hold outcome              Place temporary hold (Activity)
                                                 v
                                      Wait for signal, 24h timeout
                                      (durable — holds no thread/memory)
+                                     <- POST /transactions/{id}/respond
+                                        returns 404 for an unknown or
+                                        already-resolved transaction_id
                                                 |
                         ------------------------------------------------
                         |                       |                      |
@@ -73,9 +81,9 @@ Record no-hold outcome              Place temporary hold (Activity)
 
 | Component | Role |
 |---|---|
-| **FastAPI (`app/main.py`)** | Entry and exit point. `POST /transactions/hold` receives the handoff from the fraud engine and starts a workflow. `POST /transactions/{id}/respond` delivers the customer's response as a Temporal Signal. |
+| **FastAPI (`app/main.py`)** | Entry and exit point. `POST /transactions/hold` receives the handoff from the fraud engine and starts a workflow — resubmitting the same `transaction_id` (whether still running or already completed) returns `{"status": "already_started"}` instead of starting a duplicate. `POST /transactions/{id}/respond` delivers the customer's response as a Temporal Signal, returning a 404 if `transaction_id` doesn't match a known workflow. |
 | **Workflow (`app/workflows/fraud_hold_workflow.py`)** | Orchestrates the whole case: threshold check, activity calls, the durable wait with timeout, and the final branch (release / block / escalate). |
-| **Activities (`app/activities/`)** | `generate_explanation.py` (PydanticAI + Ollama), `hold.py` (place hold / release / block), `notify.py` (customer notification), `log_outcome.py` (no-hold logging). All mocked for the demo — swap in real integrations later. |
+| **Activities (`app/activities/`)** | `generate_explanation.py` (PydanticAI + Ollama; falls back to a fixed explanation instead of failing the workflow if the call fails after retries), `hold.py` (place hold / release / block / escalate), `notify.py` (customer notification), `log_outcome.py` (no-hold logging). All mocked for the demo — swap in real integrations later. |
 | **Worker (`app/worker.py`)** | Connects to the Temporal server, registers the workflow and activities, and executes tasks from the queue. This is the process we deliberately kill mid-demo. |
 | **`scripts/send_signal.py`** | Simulates a customer replying, independent of the FastAPI process — useful for testing signal delivery directly. |
 

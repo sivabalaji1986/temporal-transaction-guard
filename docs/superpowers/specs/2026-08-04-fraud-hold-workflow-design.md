@@ -21,8 +21,12 @@ All dependencies and images are pinned to their latest stable release as of
 - `pydantic==2.13.4` for all data passed between workflow/activities/API
 - `pydantic-settings==2.14.2` for env-driven config (separate package from
   `pydantic` in Pydantic v2 — `BaseSettings` was moved out in v2)
-- `pydantic-ai==2.22.0`, using a local Ollama model via its OpenAI-compatible
-  endpoint (`OLLAMA_BASE_URL`, default `http://localhost:11434/v1`), model name
+- `pydantic-ai-slim[openai]==2.22.0` (NOT the full `pydantic-ai` package — that
+  bundles an unused `mcp` extra which pulls in `fastmcp`/`beartype`, and
+  `beartype`'s global import hook broke Temporal's sandboxed workflow importer;
+  see `requirements.txt`'s comment and commit `0e84137` for the full diagnosis),
+  using a local Ollama model via its OpenAI-compatible endpoint
+  (`OLLAMA_BASE_URL`, default `http://localhost:11434/v1`), model name
   from `OLLAMA_MODEL` env var (default `llama3.1`)
 - Docker + docker-compose for: Temporal dev server (`temporalio/temporal:1.8.2`,
   running `temporal server start-dev`), the FastAPI app, and the worker. Ollama
@@ -36,7 +40,7 @@ fastapi==0.141.1
 uvicorn==0.52.1
 pydantic==2.13.4
 pydantic-settings==2.14.2
-pydantic-ai==2.22.0
+pydantic-ai-slim[openai]==2.22.0
 pytest==9.1.1
 pytest-asyncio==1.4.0
 ```
@@ -131,14 +135,22 @@ Module docstring summarizes the full flow (as in Purpose above).
    for zero benefit and risk the two diverging.
 3. Below threshold: call `record_no_hold_outcome` activity, workflow completes.
 4. At/above threshold:
-   a. Call `generate_explanation` activity → `InvestigationSummary`. This is the
+   a. Call `place_hold` activity first — the hold is what actually protects
+      funds, and that protection must not depend on the LLM call below
+      succeeding or being fast.
+   b. Call `generate_explanation` activity → `InvestigationSummary`. This is the
       pydantic-ai / Ollama call — renamed from "investigate" because the agent's
       job is to *explain* a decision already made in step 2, not to investigate
       or re-decide fraud (consistent with the "AI explains, doesn't decide" rule
-      in Purpose).
-   b. Call `place_hold` activity.
-   c. Call `notify_customer` activity with the investigation's customer-facing
-      explanation and notification type.
+      in Purpose). If this activity fails after exhausting its retries (e.g.
+      Ollama is unreachable), catch the resulting `ActivityError` and fall back
+      to a fixed, deterministic `InvestigationSummary` instead of failing the
+      workflow — the hold has already been placed at this point, so failing
+      the whole workflow here would leave it stuck forever with no
+      notification, no escalation, and no way to resolve it short of manual
+      intervention in Temporal.
+   c. Call `notify_customer` activity with the (real or fallback)
+      investigation's customer-facing explanation and notification type.
    d. Set up a `self._response: CustomerResponse | None = None` field, set by the
       `customer_responded` signal handler. Wait with:
       ```python
@@ -263,8 +275,8 @@ demo to a single Temporal container.
 A short test module (e.g. `tests/test_fraud_hold_workflow.py`) using Temporal's
 Python test framework — `temporalio.testing.WorkflowEnvironment` with
 time-skipping (`start_time_skipping()`) so the 24h timeout test doesn't actually
-wait 24 hours. All activities are mocked (no real Ollama call in tests). Exactly
-four cases, each short:
+wait 24 hours. All activities are mocked (no real Ollama call in tests). Five
+cases, each short:
 
 1. **Below threshold** — `fraud_score=50` → workflow completes without calling
    `place_hold`/`notify_customer`; `record_no_hold_outcome` was called.
@@ -274,6 +286,12 @@ four cases, each short:
    called.
 4. **Timeout → escalate** — above threshold, no signal sent, time-skip past 24h
    → `escalate` activity called.
+5. **`generate_explanation` failure/fallback** — above threshold, the mocked
+   `generate_explanation` activity raises on every call (simulating exhausted
+   retries) → the workflow catches the resulting `ActivityError`, falls back to
+   a fixed `InvestigationSummary`, and still notifies/waits/resolves normally
+   after a `customer_responded` signal (added post-launch to close a real
+   reliability gap — see `app/workflows/fraud_hold_workflow.py`).
 
 This is meant to demonstrate the workflow is genuinely testable without a real
 Temporal server or LLM, not to be a full suite.
@@ -283,12 +301,12 @@ Temporal server or LLM, not to be a full suite.
 - Fraud score threshold: **70**.
 - Dependency/image pins: `temporalio==1.31.0`, `fastapi==0.141.1`,
   `uvicorn==0.52.1`, `pydantic==2.13.4`, `pydantic-settings==2.14.2`,
-  `pydantic-ai==2.22.0`, `temporalio/temporal:1.8.2` — all latest stable as
-  of 2026-08-04.
+  `pydantic-ai-slim[openai]==2.22.0` (not the full `pydantic-ai` — see Stack
+  above), `temporalio/temporal:1.8.2` — all latest stable as of 2026-08-04.
 
 ## Out of Scope
 
-No database, no auth, no real payment/notification integrations. The four
+No database, no auth, no real payment/notification integrations. The five
 workflow tests above are the extent of test coverage — no API-layer or
 activity-internals tests. README already documents the run/demo steps; this
 spec does not duplicate them.
