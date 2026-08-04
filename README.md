@@ -106,6 +106,44 @@ The fraud engine hands off a transaction like this:
 
 ---
 
+## Setup and Verification
+
+Get the repo ready to work with, and confirm it's in a working state, before running anything that needs Temporal, Docker, or Ollama.
+
+1. Clone the repo:
+
+   ```bash
+   git clone https://github.com/sivabalaji1986/temporal-transaction-guard.git
+   cd temporal-transaction-guard
+   ```
+
+2. Create and activate a persistent virtual environment. This is **not** the same as a throwaway venv you might spin up just to run a one-off command — this one is meant to stay for ongoing work in the repo:
+
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate      # Windows: .venv\Scripts\activate
+   ```
+
+   `.venv` is gitignored and won't exist after a fresh clone — this step is required every time you clone the repo. If you skip it, `source .venv/bin/activate` will fail with "no such file or directory."
+
+3. Install pinned dependencies:
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. Run the test suite. This does **not** require Temporal, Docker, or Ollama to be running — all 5 tests use mocked activities and Temporal's in-memory time-skipping test environment:
+
+   ```bash
+   pytest tests/ -v
+   ```
+
+   Expected: `5 passed`. If you instead see `ModuleNotFoundError: No module named 'temporalio'`, you're running `pytest` with a different Python than the one in `.venv` — check that `which python3` and `which pytest` both point inside `.venv/bin` (a common cause is running `pytest` via a system or IDE-default Python instead of the activated venv).
+
+5. Only after tests pass, proceed to "Running locally" below to actually run the app — that part does require Temporal, and either Docker or a native Temporal dev server.
+
+---
+
 ## Running locally
 
 ### Prerequisites
@@ -113,6 +151,8 @@ The fraud engine hands off a transaction like this:
 - Python 3.11+
 - [Ollama](https://ollama.com) running locally with a model pulled, e.g. `ollama pull llama3.1`
 - Docker (optional — see below)
+
+(See [Setup and Verification](#setup-and-verification) above if you haven't already created a virtual environment and confirmed tests pass.)
 
 ### Option A: Docker (recommended)
 
