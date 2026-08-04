@@ -16,8 +16,9 @@ FRAUD_SCORE_THRESHOLD = 70
 
 def make_mock_activities(
     generate_explanation_fails: bool = False,
-) -> tuple[list[str], list[Callable]]:
+) -> tuple[list[str], list[str], list[Callable]]:
     calls: list[str] = []
+    notify_messages: list[str] = []
 
     @activity.defn(name="record_no_hold_outcome")
     async def record_no_hold_outcome(transaction_id: str, fraud_score: float) -> None:
@@ -41,6 +42,7 @@ def make_mock_activities(
     @activity.defn(name="notify_customer")
     async def notify_customer(customer_id: str, message: str, notification_type: str) -> None:
         calls.append("notify_customer")
+        notify_messages.append(message)
 
     @activity.defn(name="release")
     async def release(transaction_id: str) -> None:
@@ -54,7 +56,7 @@ def make_mock_activities(
     async def escalate(transaction_id: str) -> None:
         calls.append("escalate")
 
-    return calls, [
+    return calls, notify_messages, [
         record_no_hold_outcome,
         generate_explanation,
         place_hold,
@@ -76,7 +78,7 @@ def make_transaction(transaction_id: str, fraud_score: float) -> Transaction:
 
 @pytest.mark.asyncio
 async def test_below_threshold_records_no_hold_outcome():
-    calls, activities = make_mock_activities()
+    calls, notify_messages, activities = make_mock_activities()
     task_queue = str(uuid.uuid4())
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
@@ -99,7 +101,7 @@ async def test_below_threshold_records_no_hold_outcome():
 
 @pytest.mark.asyncio
 async def test_it_was_me_releases():
-    calls, activities = make_mock_activities()
+    calls, notify_messages, activities = make_mock_activities()
     task_queue = str(uuid.uuid4())
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
@@ -132,7 +134,7 @@ async def test_it_was_me_releases():
 
 @pytest.mark.asyncio
 async def test_not_me_blocks():
-    calls, activities = make_mock_activities()
+    calls, notify_messages, activities = make_mock_activities()
     task_queue = str(uuid.uuid4())
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
@@ -165,7 +167,7 @@ async def test_not_me_blocks():
 
 @pytest.mark.asyncio
 async def test_timeout_escalates():
-    calls, activities = make_mock_activities()
+    calls, notify_messages, activities = make_mock_activities()
     task_queue = str(uuid.uuid4())
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
@@ -188,7 +190,7 @@ async def test_timeout_escalates():
 
 @pytest.mark.asyncio
 async def test_ai_failure_falls_back_and_still_resolves():
-    calls, activities = make_mock_activities(generate_explanation_fails=True)
+    calls, notify_messages, activities = make_mock_activities(generate_explanation_fails=True)
     task_queue = str(uuid.uuid4())
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
@@ -217,3 +219,10 @@ async def test_ai_failure_falls_back_and_still_resolves():
     # fell back, then still notified, waited, and resolved normally.
     assert "generate_explanation" in calls
     assert "notify_customer" in calls
+    # The customer must have been notified with the fallback message, not
+    # the AI-generated one (the AI mock's success message is "test
+    # explanation" -- confirm that never went out, and the actual fallback
+    # text from the workflow's except block did).
+    assert len(notify_messages) == 1
+    assert notify_messages[0] != "test explanation"
+    assert "temporarily paused" in notify_messages[0]
