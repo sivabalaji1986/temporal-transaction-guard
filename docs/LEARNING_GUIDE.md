@@ -90,7 +90,7 @@ class CustomerResponse(BaseModel):
 - **`Field(alias="transactionId")`** — the fraud engine that calls our API sends JSON with camelCase keys (`transactionId`, `fraudScore`), but Python convention is snake_case (`transaction_id`, `fraud_score`). `alias=` tells Pydantic "when reading JSON, look for this key instead of the field's Python name." `model_config = ConfigDict(populate_by_name=True)` additionally allows constructing a `Transaction` using the Python names directly (useful in tests — see Section 2.11), not just the aliases.
 
 **Calls out to:** nothing — this is a leaf file, it has no dependencies on the rest of the project.
-**Called by:** almost everything — `hold.py`... no wait, actually just the files that need to *describe* data: `generate_explanation.py`, `fraud_hold_workflow.py`, `main.py`, `send_signal.py`, and the tests.
+**Called by:** `generate_explanation.py`, `fraud_hold_workflow.py`, `main.py`, `send_signal.py`, and the tests.
 
 **Data flow:** nothing flows *through* this file at runtime — it just defines the containers other files put data into.
 
@@ -577,7 +577,7 @@ async def respond_to_transaction(transaction_id: str, response: CustomerResponse
 - **`id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE`** — tells Temporal to refuse starting a new workflow reusing an ID that's ever been used before, even by a workflow that's already finished.
 - **`except WorkflowAlreadyStartedError:`** — if the same `transaction_id` is submitted twice (either while the first one is still running, or after it's already finished, thanks to the policy above), Temporal raises this specific error instead of starting a duplicate. This is caught and turned into a clean `{"status": "already_started"}` response instead of crashing.
 - **`respond_to_transaction`** — notice `transaction_id` appears both in the URL path (`{transaction_id}`) and as a function parameter of the same name — FastAPI automatically fills that parameter in from the URL. `handle.signal(FraudHoldWorkflow.customer_responded, response)` is how the API delivers a Signal to an already-running (or paused) workflow — this is what actually wakes up the `wait_condition` we saw in Section 2.7.
-- **`except RPCError:`** paired with **`raise HTTPException(status_code=404, ...)`** — if `transaction_id` doesn't match any known workflow (typo'd, or already fully resolved), signaling it fails with Temporal's general `RPCError`. Rather than let that crash into an ugly generic error, it's turned into a proper HTTP 404. `raise` is how you deliberately trigger an exception yourself, rather than one happening naturally — `HTTPException` is FastAPI's own exception type specifically for "stop, and send this HTTP error status back to the caller."
+- **`except RPCError:`** paired with **`raise HTTPException(status_code=404, ...)`** — in this demo, an `RPCError` here is converted to an HTTP 404, mainly to handle an unknown or already-resolved `transaction_id`. But `RPCError` is a broad exception type — it's Temporal's general category for "the RPC call to the Temporal service failed," which could also mean something unrelated, like the Temporal server being unreachable. Production code would want to distinguish a genuine "workflow not found/closed" error from an unrelated infrastructure failure before deciding what HTTP status to return; this demo doesn't make that distinction, for simplicity. `raise` is how you deliberately trigger an exception yourself, rather than one happening naturally — `HTTPException` is FastAPI's own exception type specifically for "stop, and send this HTTP error status back to the caller."
 
 **Calls out to:** `config.py`, `models.py`, `fraud_hold_workflow.py`.
 **Called by:** nobody (in Python terms) — it's the process an ASGI server (`uvicorn`) runs directly.
@@ -734,7 +734,7 @@ async def test_it_was_me_releases():
 
 ### 2.12 The `__init__.py` files
 
-`app/__init__.py`, `app/activities/__init__.py`, `app/workflows/__init__.py`, and `scripts/__init__.py` are all completely empty. Their only job is to tell Python "treat this folder as a package" — a collection of importable modules — which is what makes writing `from app.activities.hold import place_hold` (instead of some more awkward path-based import) possible throughout this project. There's nothing to read inside them. (If you know Java: a Python package — a folder containing an `__init__.py` — plays roughly the same organizing role as a Java package, and `app.activities.hold` reads much like a Java package path such as `app.activities.hold`, just with dots instead of matching directory-and-namespace declarations.)
+`app/__init__.py`, `app/activities/__init__.py`, `app/workflows/__init__.py`, and `scripts/__init__.py` are all completely empty. These empty files explicitly mark these directories as regular Python packages — not strictly required in every modern Python setup (Python 3.3+ also supports "implicit namespace packages," folders with no `__init__.py` at all), but doing it explicitly here keeps imports and tooling behavior predictable, and is what makes writing `from app.activities.hold import place_hold` (instead of some more awkward path-based import) possible throughout this project. There's nothing to read inside them. (If you know Java: a Python package — a folder containing an `__init__.py` — plays roughly the same organizing role as a Java package, and `app.activities.hold` reads much like a Java package path such as `app.activities.hold`, just with dots instead of matching directory-and-namespace declarations.)
 
 ---
 
@@ -767,7 +767,7 @@ Now that every file and every concept has been introduced, let's trace two compl
 3. The worker picks it up and starts **`app/workflows/fraud_hold_workflow.py`**, `FraudHoldWorkflow.run(...)`.
 4. The threshold check (`transaction.fraud_score < fraud_score_threshold`) is **true** this time.
 5. The workflow calls `record_no_hold_outcome` → the worker executes **`app/activities/log_outcome.py`**, `record_no_hold_outcome(...)`.
-6. `run` immediately returns `"no_hold_needed"`. No hold was ever placed, no AI call happened, no notification was sent, and the workflow never pauses — it completes in one pass, in well under a second.
+6. `run` immediately returns `"no_hold_needed"`. No hold was ever placed, no AI call happened, no notification was sent — it completes without ever entering the long-running customer-response wait.
 
 Notice how much of `FraudHoldWorkflow.run` — the AI call, the hold, the notification, the entire wait-for-signal mechanism — Scenario B simply never touches. That's the whole point of the threshold check living right at the top of the function.
 
