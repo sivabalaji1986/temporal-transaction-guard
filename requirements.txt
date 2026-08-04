@@ -3,6 +3,6 @@ fastapi==0.141.1
 uvicorn==0.52.1
 pydantic==2.13.4
 pydantic-settings==2.14.2
-pydantic-ai==2.22.0
+pydantic-ai-slim[openai]==2.22.0
 pytest==9.1.1
 pytest-asyncio==1.4.0
