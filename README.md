@@ -228,6 +228,7 @@ Ollama is expected to run on your **host machine**, not inside Docker — the wo
 ### Option B: Run it all natively
 
 ```bash
+# If you haven't already (see Setup and Verification above):
 pip install -r requirements.txt
 
 # terminal 1: start a local Temporal dev server
@@ -364,7 +365,7 @@ The workflow resumes from exactly where it paused and resolves the case correctl
 
 ### Stopping everything
 
-- **Docker (Option A):** `docker compose down`
+- **Docker (Option A):** `docker compose down` (add `-v` for a full reset that also wipes Temporal's dev-server data — namespaces, workflow history, everything. Only needed if you want a completely clean slate, not for routine shutdown)
 - **Native (Option B):** stop each of the three terminals with `Ctrl+C`, in any order
 
 ---
