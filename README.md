@@ -89,6 +89,35 @@ Record no-hold outcome              Place temporary hold (Activity)
 
 ---
 
+## Repository structure
+
+```
+temporal-transaction-guard/
+├── requirements.txt
+├── docker-compose.yml
+├── Dockerfile
+├── .env.example
+├── pytest.ini
+├── app/
+│   ├── main.py
+│   ├── models.py
+│   ├── config.py
+│   ├── worker.py
+│   ├── workflows/
+│   │   └── fraud_hold_workflow.py
+│   └── activities/
+│       ├── generate_explanation.py
+│       ├── hold.py
+│       ├── notify.py
+│       └── log_outcome.py
+├── scripts/
+│   └── send_signal.py
+└── tests/
+    └── test_fraud_hold_workflow.py
+```
+
+---
+
 ## Input contract
 
 The fraud engine hands off a transaction like this:
@@ -143,7 +172,7 @@ Get the repo ready to work with, and confirm it's in a working state, before run
 5. Copy the example environment file:
 
    ```bash
-   cp .env.example .env
+   cp .env.example .env        # Windows: Copy-Item .env.example .env
    ```
 
    The Ollama and Temporal environment variables referenced throughout this README (`OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `TEMPORAL_ADDRESS`, etc.) won't take effect until this file exists — `.env.example` is a template, not something the app reads directly.
@@ -154,9 +183,13 @@ Get the repo ready to work with, and confirm it's in a working state, before run
    # Ollama needs to be running before you can pull a model or use the app.
    # On Mac, the Ollama desktop app already runs this in the background --
    # only run it manually (e.g. on Linux, or if `ollama list` below fails
-   # to connect) if it's not already running:
+   # to connect) if it's not already running. `ollama serve` runs in the
+   # foreground and blocks, so give it its own terminal (or start it as a
+   # background service) -- running the commands below in that same
+   # terminal would just hang waiting for `ollama serve` to return:
    ollama serve
 
+   # (in a separate terminal, once ollama serve is running)
    ollama pull llama3.1
    ollama list
    curl http://localhost:11434/api/tags
@@ -328,6 +361,11 @@ HTTP/1.1 404 Not Found
 5. Send the `respond` request from above.
 
 The workflow resumes from exactly where it paused and resolves the case correctly — no lost progress — even though the process that was running it died in the middle. (Temporal guarantees the workflow's durable progress and correct replay; it does not give activities exactly-once execution — they're at-least-once, so a real, non-mocked hold/release/block integration would need to be idempotent on its own, e.g. keyed by `transaction_id`.)
+
+### Stopping everything
+
+- **Docker (Option A):** `docker compose down`
+- **Native (Option B):** stop each of the three terminals with `Ctrl+C`, in any order
 
 ---
 
