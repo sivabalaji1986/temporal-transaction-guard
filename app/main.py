@@ -1,17 +1,17 @@
 from contextlib import asynccontextmanager
-from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from temporalio.client import Client
 from temporalio.common import WorkflowIDReusePolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.service import RPCError
 
 from app.config import settings
 from app.models import CustomerResponse, Transaction
 from app.workflows.fraud_hold_workflow import FraudHoldWorkflow
 
-_client: Optional[Client] = None
+_client: Client | None = None
 
 
 @asynccontextmanager
@@ -61,5 +61,11 @@ async def hold_transaction(transaction: Transaction) -> dict:
 async def respond_to_transaction(transaction_id: str, response: CustomerResponse) -> dict:
     assert _client is not None
     handle = _client.get_workflow_handle(transaction_id)
-    await handle.signal(FraudHoldWorkflow.customer_responded, response)
+    try:
+        await handle.signal(FraudHoldWorkflow.customer_responded, response)
+    except RPCError:
+        # Signaling a transaction_id with no matching workflow (unknown or
+        # already-completed) raises here rather than returning a normal
+        # response -- surface it as a clean 404 instead of an unhandled 500.
+        raise HTTPException(status_code=404, detail=f"No transaction found for {transaction_id!r}")
     return {"status": "signal_sent"}

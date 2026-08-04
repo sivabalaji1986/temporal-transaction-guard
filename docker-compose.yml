@@ -24,7 +24,12 @@ services:
     environment:
       - TEMPORAL_ADDRESS=temporal:7233
       - TASK_QUEUE=${TASK_QUEUE:-fraud-hold-task-queue}
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
+      # Hardcoded, not interpolated from .env: a native .env (per
+      # .env.example) correctly points at http://localhost:11434/v1 for
+      # non-Docker use, but "localhost" inside a container means the
+      # container itself, not the host running Ollama. See TEMPORAL_ADDRESS
+      # above for the same reasoning.
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
       - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1}
       - FRAUD_SCORE_THRESHOLD=${FRAUD_SCORE_THRESHOLD:-70}
     extra_hosts:
@@ -39,7 +44,8 @@ services:
     environment:
       - TEMPORAL_ADDRESS=temporal:7233
       - TASK_QUEUE=${TASK_QUEUE:-fraud-hold-task-queue}
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
+      # See the api service above: hardcoded on purpose, not interpolated.
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
       - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1}
       - FRAUD_SCORE_THRESHOLD=${FRAUD_SCORE_THRESHOLD:-70}
     extra_hosts:

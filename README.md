@@ -1,6 +1,6 @@
 # temporal-transaction-guard
 
-A durable **investigate → hold → notify → wait → resolve** workflow for suspicious transactions, built on [Temporal](https://temporal.io), [FastAPI](https://fastapi.tiangolo.com), [PydanticAI](https://ai.pydantic.dev), and a local [Ollama](https://ollama.com) model.
+A durable **hold → generate_explanation → notify → wait → resolve** workflow for suspicious transactions, built on [Temporal](https://temporal.io), [FastAPI](https://fastapi.tiangolo.com), [PydanticAI](https://ai.pydantic.dev), and a local [Ollama](https://ollama.com) model.
 
 > **What this project is *not*:** a fraud-detection engine. We assume a bank's existing fraud system has already flagged a transaction and handed it to us with a score and a reason. This project is only responsible for what happens *after* that: placing a hold, explaining it to the customer, waiting durably for a response, and resolving the case — correctly, even if a server crashes in the middle.
 
@@ -10,7 +10,7 @@ A durable **investigate → hold → notify → wait → resolve** workflow for 
 
 Most fraud-hold logic is written as request/response code: check a score, call an API, maybe write a row to a database saying "waiting for customer." That approach has a real weakness — if the process crashes while a hold is open and a customer is expected to respond hours or days later, someone has to rebuild "where was this case?" by hand from whatever state made it to the database.
 
-Temporal removes that problem. A workflow's progress is recorded as an event history on the Temporal server, not just in your process's memory. If the worker process dies — mid-hold, mid-wait, doesn't matter — a new worker can pick the workflow back up and continue exactly where it left off, with no duplicate holds, no duplicate notifications, and no lost cases.
+Temporal removes that problem. A workflow's progress is recorded as an event history on the Temporal server, not just in your process's memory. If the worker process dies — mid-hold, mid-wait, doesn't matter — a new worker can pick the workflow back up and continue exactly where it left off, with no lost cases and no re-deciding what already happened. (This is a guarantee about the *workflow's* durable progress and correct replay, not about individual activities — those are at-least-once and can legitimately retry, so a real hold/release/notify integration still needs to be idempotent on its own.)
 
 This repo is a small, runnable demonstration of that guarantee, applied to a believable banking scenario.
 
@@ -35,14 +35,16 @@ Deterministic threshold check          <- pure workflow logic, NOT an activity
 no hold needed                        hold needed
    |                                        |
    v                                        v
-Record no-hold outcome              PydanticAI generates:
-(Activity) -> workflow completes    - customer-friendly explanation
+Record no-hold outcome              Place temporary hold (Activity)
+(Activity) -> workflow completes    <- funds are protected first; this
+                                        must not wait on the LLM below
+                                                |
+                                                v
+                                     PydanticAI generates:
+                                     - customer-friendly explanation
                                      - operations summary
                                      - notification content
                                      (Activity, calls local Ollama model)
-                                                |
-                                                v
-                                     Place temporary hold (Activity)
                                                 |
                                                 v
                                      Notify customer (Activity)
@@ -73,7 +75,7 @@ Record no-hold outcome              PydanticAI generates:
 |---|---|
 | **FastAPI (`app/main.py`)** | Entry and exit point. `POST /transactions/hold` receives the handoff from the fraud engine and starts a workflow. `POST /transactions/{id}/respond` delivers the customer's response as a Temporal Signal. |
 | **Workflow (`app/workflows/fraud_hold_workflow.py`)** | Orchestrates the whole case: threshold check, activity calls, the durable wait with timeout, and the final branch (release / block / escalate). |
-| **Activities (`app/activities/`)** | `investigate.py` (PydanticAI + Ollama), `hold.py` (place hold / release / block), `notify.py` (customer notification), `log_outcome.py` (no-hold logging). All mocked for the demo — swap in real integrations later. |
+| **Activities (`app/activities/`)** | `generate_explanation.py` (PydanticAI + Ollama), `hold.py` (place hold / release / block), `notify.py` (customer notification), `log_outcome.py` (no-hold logging). All mocked for the demo — swap in real integrations later. |
 | **Worker (`app/worker.py`)** | Connects to the Temporal server, registers the workflow and activities, and executes tasks from the queue. This is the process we deliberately kill mid-demo. |
 | **`scripts/send_signal.py`** | Simulates a customer replying, independent of the FastAPI process — useful for testing signal delivery directly. |
 
@@ -107,7 +109,7 @@ The fraud engine hands off a transaction like this:
 ### Option A: Docker (recommended)
 
 ```bash
-docker compose up
+docker compose up --build
 ```
 
 This brings up:
@@ -115,7 +117,7 @@ This brings up:
 - the FastAPI app (`http://localhost:8000`)
 - a Temporal worker
 
-Ollama is expected to run on your **host machine**, not inside Docker — the worker container talks to it via `http://host.docker.internal:11434` (already wired into `docker-compose.yml`). This avoids bundling model weights into the container and lets you swap models without rebuilding.
+Ollama is expected to run on your **host machine**, not inside Docker — the worker container talks to it via `http://host.docker.internal:11434/v1` (already wired into `docker-compose.yml`). This avoids bundling model weights into the container and lets you swap models without rebuilding.
 
 ### Option B: Run it all natively
 
@@ -137,11 +139,11 @@ uvicorn app.main:app --reload
 Set these in `.env` (see `.env.example`):
 
 ```
-OLLAMA_HOST=http://localhost:11434
+OLLAMA_BASE_URL=http://localhost:11434/v1
 OLLAMA_MODEL=llama3.1
 ```
 
-The `investigate` activity uses PydanticAI's OpenAI-compatible provider pointed at Ollama's local endpoint — no external API key, no data leaving your machine.
+The `generate_explanation` activity uses PydanticAI's OpenAI-compatible provider pointed at Ollama's local endpoint — no external API key, no data leaving your machine.
 
 ---
 
@@ -174,7 +176,7 @@ curl -X POST http://localhost:8000/transactions/TXN-1001/respond \
 4. Restart it.
 5. Send the `respond` request from above.
 
-The workflow resumes from exactly where it paused and resolves the case exactly once — no duplicate hold, no duplicate notification — even though the process that was running it died in the middle.
+The workflow resumes from exactly where it paused and resolves the case correctly — no lost progress — even though the process that was running it died in the middle. (Temporal guarantees the workflow's durable progress and correct replay; it does not give activities exactly-once execution — they're at-least-once, so a real, non-mocked hold/release/block integration would need to be idempotent on its own, e.g. keyed by `transaction_id`.)
 
 ---
 
