@@ -15,6 +15,7 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError
 
 from app.models import CustomerResponse, InvestigationSummary, Transaction
 
@@ -62,14 +63,35 @@ class FraudHoldWorkflow:
             start_to_close_timeout=timedelta(seconds=10),
         )
 
-        investigation: InvestigationSummary = await workflow.execute_activity(
-            generate_explanation,
-            args=[transaction.fraud_score, transaction.trigger_reason],
-            start_to_close_timeout=timedelta(seconds=30),
-            retry_policy=RetryPolicy(
-                maximum_attempts=3, initial_interval=timedelta(seconds=1)
-            ),
-        )
+        # If the LLM call fails even after retries (e.g. Ollama is down),
+        # fall back to a deterministic explanation instead of letting the
+        # ActivityError propagate. The hold has already been placed; failing
+        # the whole workflow here would leave the transaction held forever
+        # with no notification, no escalation, and no way to resolve it
+        # short of manual intervention in Temporal.
+        try:
+            investigation: InvestigationSummary = await workflow.execute_activity(
+                generate_explanation,
+                args=[transaction.fraud_score, transaction.trigger_reason],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(
+                    maximum_attempts=3, initial_interval=timedelta(seconds=1)
+                ),
+            )
+        except ActivityError:
+            investigation = InvestigationSummary(
+                customer_explanation=(
+                    "We temporarily paused this transaction because it was "
+                    "flagged by our fraud monitoring system. We'll follow up "
+                    "shortly."
+                ),
+                ops_summary=(
+                    f"generate_explanation failed after retries for "
+                    f"transaction {transaction.transaction_id}; used "
+                    f"fallback message."
+                ),
+                notification_type="sms",
+            )
 
         await workflow.execute_activity(
             notify_customer,
