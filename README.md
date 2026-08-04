@@ -140,7 +140,31 @@ Get the repo ready to work with, and confirm it's in a working state, before run
 
    Expected: `5 passed`. If you instead see `ModuleNotFoundError: No module named 'temporalio'`, you're running `pytest` with a different Python than the one in `.venv` — check that `which python3` and `which pytest` both point inside `.venv/bin` (a common cause is running `pytest` via a system or IDE-default Python instead of the activated venv).
 
-5. Only after tests pass, proceed to "Running locally" below to actually run the app — that part does require Temporal, and either Docker or a native Temporal dev server.
+5. Copy the example environment file:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+   The Ollama and Temporal environment variables referenced throughout this README (`OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `TEMPORAL_ADDRESS`, etc.) won't take effect until this file exists — `.env.example` is a template, not something the app reads directly.
+
+6. Confirm Ollama is running and has a model pulled:
+
+   ```bash
+   # Ollama needs to be running before you can pull a model or use the app.
+   # On Mac, the Ollama desktop app already runs this in the background --
+   # only run it manually (e.g. on Linux, or if `ollama list` below fails
+   # to connect) if it's not already running:
+   ollama serve
+
+   ollama pull llama3.1
+   ollama list
+   curl http://localhost:11434/api/tags
+   ```
+
+   `ollama list` and the `curl` should both show `llama3.1` (or whatever you set `OLLAMA_MODEL` to) once it's pulled. If either fails to connect instead, Ollama isn't running yet — run `ollama serve` above first.
+
+7. Only after tests pass, proceed to "Running locally" below to actually run the app — that part does require Temporal, and either Docker or a native Temporal dev server.
 
 ---
 
@@ -151,6 +175,7 @@ Get the repo ready to work with, and confirm it's in a working state, before run
 - Python 3.11+
 - [Ollama](https://ollama.com) running locally with a model pulled, e.g. `ollama pull llama3.1`
 - Docker (optional — see below)
+- [Temporal CLI](https://docs.temporal.io/cli#install) — required for Option B (native `temporal server start-dev`); **not** required for Option A (Docker), which bundles its own Temporal dev server
 
 (See [Setup and Verification](#setup-and-verification) above if you haven't already created a virtual environment and confirmed tests pass.)
 
@@ -182,6 +207,23 @@ python -m app.worker
 uvicorn app.main:app --reload
 ```
 
+### Verify it's running
+
+**Docker (Option A):**
+
+```bash
+docker compose ps              # temporal, api, worker should all show as Up
+docker compose logs -f worker  # look for "Worker started, polling task queue..."
+```
+
+Then open `http://localhost:8233` in your browser for the Temporal Web UI.
+
+**Native (Option B):**
+
+Check the worker's own terminal (terminal 2 above) for `Worker started, polling task queue '...'`, then open `http://localhost:8233` (Temporal Web UI — `temporal server start-dev` serves this too) and `http://localhost:8000/docs` (FastAPI's interactive docs) in your browser to confirm both processes are up.
+
+There's no `/health` endpoint on the API today — `/docs` (FastAPI's built-in Swagger UI, on by default) is the honest way to confirm it's responding without one. A dedicated health-check endpoint would be a reasonable future addition, but that's out of scope for this doc-only pass.
+
 ### Connecting to Ollama
 
 Set these in `.env` (see `.env.example`):
@@ -208,12 +250,73 @@ curl -X POST http://localhost:8000/transactions/hold \
   }'
 ```
 
+Response:
+
+```json
+{"workflow_id":"TXN-1001","status":"started"}
+```
+
 Simulate the customer's reply:
 
 ```bash
 curl -X POST http://localhost:8000/transactions/TXN-1001/respond \
   -H "Content-Type: application/json" \
   -d '{"response": "it_was_me"}'
+```
+
+Response:
+
+```json
+{"status":"signal_sent"}
+```
+
+### More examples
+
+A transaction below the fraud-score threshold (default `70`, see `FRAUD_SCORE_THRESHOLD` in `.env.example`) — the response shape is identical to a held transaction; the difference (no hold placed, no notification sent) only shows up in the worker's logs or the Temporal Web UI, not in this response:
+
+```bash
+curl -X POST http://localhost:8000/transactions/hold \
+  -H "Content-Type: application/json" \
+  -d '{"transactionId": "TXN-2001", "fraudScore": 40, "triggerReason": "MINOR_ANOMALY", "customerId": "CUST-202"}'
+```
+
+```json
+{"workflow_id":"TXN-2001","status":"started"}
+```
+
+A `"not_me"` response — also `{"status":"signal_sent"}`, since this endpoint only confirms the signal was delivered; whether the workflow resolves to `release` or `block` isn't reflected here, only in the logs/Web UI:
+
+```bash
+curl -X POST http://localhost:8000/transactions/TXN-1001/respond \
+  -H "Content-Type: application/json" \
+  -d '{"response": "not_me"}'
+```
+
+Submitting the same `transaction_id` a second time (idempotency — see [Architecture](#architecture)):
+
+```bash
+curl -X POST http://localhost:8000/transactions/hold \
+  -H "Content-Type: application/json" \
+  -d '{"transactionId": "TXN-1001", "fraudScore": 78, "triggerReason": "UNUSUAL_LOCATION", "customerId": "CUST-101"}'
+```
+
+```json
+{"workflow_id":"TXN-1001","status":"already_started"}
+```
+
+Responding to a `transaction_id` that was never submitted (or was already resolved):
+
+```bash
+curl -i -X POST http://localhost:8000/transactions/TXN-DOES-NOT-EXIST/respond \
+  -H "Content-Type: application/json" \
+  -d '{"response": "it_was_me"}'
+```
+
+```
+HTTP/1.1 404 Not Found
+```
+```json
+{"detail":"No transaction found for 'TXN-DOES-NOT-EXIST'"}
 ```
 
 ## The crash-resume demo
@@ -225,6 +328,16 @@ curl -X POST http://localhost:8000/transactions/TXN-1001/respond \
 5. Send the `respond` request from above.
 
 The workflow resumes from exactly where it paused and resolves the case correctly — no lost progress — even though the process that was running it died in the middle. (Temporal guarantees the workflow's durable progress and correct replay; it does not give activities exactly-once execution — they're at-least-once, so a real, non-mocked hold/release/block integration would need to be idempotent on its own, e.g. keyed by `transaction_id`.)
+
+---
+
+## Troubleshooting
+
+**Ollama isn't running, or the wrong model is configured.** `generate_explanation` will retry 3 times against `OLLAMA_BASE_URL`/`OLLAMA_MODEL` (from `.env`) and then fall back to a fixed explanation rather than failing the workflow — see the Architecture diagram above. So a broken Ollama setup won't crash a held transaction, but it will mean every hold gets the generic fallback message instead of a real explanation. Confirm with `ollama list` and `curl http://localhost:11434/api/tags` (see [Setup and Verification](#setup-and-verification)); double-check `OLLAMA_MODEL` in `.env` matches a model you've actually pulled.
+
+**Port already in use (`8000`, `7233`, or `8233`).** These are used by the API, the Temporal frontend service, and the Temporal Web UI respectively. Find whatever's already bound to the port (e.g. `lsof -i :8000` on Mac/Linux) and stop it, or change the mapping in `docker-compose.yml`'s `ports:` (Docker) — for native mode, `uvicorn app.main:app --port <other-port>` and `temporal server start-dev --ui-port <other-port>` accept alternate ports directly.
+
+**A workflow seems stuck** (no response after `/hold`, or `/respond` doesn't seem to do anything). Start with `docker compose logs worker` (or the worker's own terminal in native mode) — every activity prints when it runs, so you can see exactly how far the workflow got. Then check the workflow's state directly in the Temporal Web UI (`http://localhost:8233`): open the workflow by its `transaction_id` and look at its event history — a workflow parked in `wait_condition` is normal and expected until a `/respond` signal (or the 24h timeout) arrives.
 
 ---
 
