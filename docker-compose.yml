@@ -30,7 +30,7 @@ services:
       # container itself, not the host running Ollama. See TEMPORAL_ADDRESS
       # above for the same reasoning.
       - OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
-      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3.5:latest}
       - FRAUD_SCORE_THRESHOLD=${FRAUD_SCORE_THRESHOLD:-70}
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -46,7 +46,7 @@ services:
       - TASK_QUEUE=${TASK_QUEUE:-fraud-hold-task-queue}
       # See the api service above: hardcoded on purpose, not interpolated.
       - OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
-      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3.5:latest}
       - FRAUD_SCORE_THRESHOLD=${FRAUD_SCORE_THRESHOLD:-70}
     extra_hosts:
       - "host.docker.internal:host-gateway"

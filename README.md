@@ -190,12 +190,12 @@ Get the repo ready to work with, and confirm it's in a working state, before run
    ollama serve
 
    # (in a separate terminal, once ollama serve is running)
-   ollama pull llama3.1
+   ollama pull qwen3.5:latest
    ollama list
    curl http://localhost:11434/api/tags
    ```
 
-   `ollama list` and the `curl` should both show `llama3.1` (or whatever you set `OLLAMA_MODEL` to) once it's pulled. If either fails to connect instead, Ollama isn't running yet — run `ollama serve` above first.
+   `ollama list` and the `curl` should both show `qwen3.5:latest` (or whatever you set `OLLAMA_MODEL` to) once it's pulled. If either fails to connect instead, Ollama isn't running yet — run `ollama serve` above first.
 
 7. Only after tests pass, proceed to "Running locally" below to actually run the app — that part does require Temporal, and either Docker or a native Temporal dev server.
 
@@ -206,7 +206,7 @@ Get the repo ready to work with, and confirm it's in a working state, before run
 ### Prerequisites
 
 - Python 3.11+
-- [Ollama](https://ollama.com) running locally with a model pulled, e.g. `ollama pull llama3.1`
+- [Ollama](https://ollama.com) running locally with a model pulled, e.g. `ollama pull qwen3.5:latest`
 - Docker (optional — see below)
 - [Temporal CLI](https://docs.temporal.io/cli#install) — required for Option B (native `temporal server start-dev`); **not** required for Option A (Docker), which bundles its own Temporal dev server
 
@@ -264,7 +264,7 @@ Set these in `.env` (see `.env.example`):
 
 ```
 OLLAMA_BASE_URL=http://localhost:11434/v1
-OLLAMA_MODEL=llama3.1
+OLLAMA_MODEL=qwen3.5:latest
 ```
 
 The `generate_explanation` activity uses PydanticAI's OpenAI-compatible provider pointed at Ollama's local endpoint — no external API key, no data leaving your machine.

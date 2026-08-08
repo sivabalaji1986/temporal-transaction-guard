@@ -108,7 +108,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     ollama_base_url: str = "http://localhost:11434/v1"
-    ollama_model: str = "llama3.1"
+    ollama_model: str = "qwen3.5:latest"
     temporal_address: str = "localhost:7233"
     task_queue: str = "fraud-hold-task-queue"
     fraud_score_threshold: float = 70
