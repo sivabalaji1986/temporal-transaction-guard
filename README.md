@@ -75,6 +75,40 @@ Record no-hold outcome              Place temporary hold (Activity)
 - **Everything that touches the outside world is an Activity:** calling the LLM, placing a hold, sending a notification, releasing/blocking funds, logging the no-hold outcome. Activities are the only things that can fail, retry, and have side effects.
 - **The AI's job is explanation, not judgment.** The PydanticAI agent turns an already-computed fraud score and trigger reason into a structured, human-readable explanation and notification copy. It does **not** decide whether to hold — that decision is a deterministic threshold check the bank's own score already justifies. This keeps the article/demo focused on durable orchestration, not on whether an LLM makes good fraud judgments.
 
+### How this shows up in Temporal's Event History
+
+Open any workflow in the Temporal Web UI (`http://localhost:8233`) and click its **Event History** tab, and you'll see a repeating pattern rather than one line per activity. That's expected — here's how to read it:
+
+- **Workflow Task** — the worker waking up to run/replay `FraudHoldWorkflow.run` up to its next decision point, then going back to sleep. Every activity call, every signal, and the timer firing/being canceled each trigger one of these. Recorded as 3 events: `WorkflowTaskScheduled` → `WorkflowTaskStarted` → `WorkflowTaskCompleted`.
+- **Activity Task** — the actual execution of one activity (`place_hold`, `generate_explanation`, `notify_customer`, `release`/`block`/`escalate`). Also 3 events — `ActivityTaskScheduled` → `ActivityTaskStarted` → `ActivityTaskCompleted` — plus one extra `ActivityTaskStarted` per retry attempt if it fails and gets retried (check the `Attempt` field, and `Last Failure` on that event for why the previous attempt didn't succeed).
+- **Timer** — the durable 24h wait: `TimerStarted` when `wait_condition`'s timeout kicks in, then either `TimerCanceled` (a signal arrived first) or `TimerFired` (24h passed with no response).
+- **Signal** — `WorkflowExecutionSignaled` the moment `/respond` (or `send_signal.py`) delivers `customer_responded`.
+- **Completion** — `WorkflowExecutionCompleted`, the terminal event, carrying the final result string.
+
+Stacked together, an above-threshold hold that gets resolved via signal looks like this:
+
+```
+WorkflowExecutionStarted
+  Workflow Task  -> decide: call place_hold
+  Activity Task: place_hold
+  Workflow Task  -> decide: call generate_explanation
+  Activity Task: generate_explanation
+  Workflow Task  -> decide: call notify_customer
+  Activity Task: notify_customer
+  Workflow Task  -> decide: start the 24h wait
+  TimerStarted
+  ...workflow durably parked here -- no thread, no process, just this
+     recorded state -- until one of the two below happens...
+  WorkflowExecutionSignaled (customer_responded)   <- or TimerFired, if 24h passes first
+  Workflow Task  -> decide: signal arrived, cancel the timer, call release/block
+  TimerCanceled
+  Activity Task: release  (or: block)
+  Workflow Task  -> decide: return the result
+  WorkflowExecutionCompleted ("released")
+```
+
+Since each "Workflow Task" and "Activity Task" line above is really 3 history events, a single resolved hold typically ends up as ~30-35 total events. That's normal, not a sign anything's wrong — every one of those events is a durability checkpoint permanently recorded by the Temporal *server*, independent of the worker process. That's exactly why killing and restarting the worker mid-hold (see [the crash-resume demo](#the-crash-resume-demo) below) doesn't lose any progress: a new worker just picks up where this history left off.
+
 ---
 
 ## Components
@@ -356,7 +390,7 @@ HTTP/1.1 404 Not Found
 ## The crash-resume demo
 
 1. Start the worker and fire the `hold` request above.
-2. Confirm in the Temporal Web UI (`http://localhost:8233`) that the workflow is now sitting in **"waiting for signal."**
+2. Confirm in the Temporal Web UI (`http://localhost:8233`) that the workflow is now sitting in **"waiting for signal."** Open its **Event History** tab while you're there — see [How this shows up in Temporal's Event History](#how-this-shows-up-in-temporals-event-history) above for how to read it.
 3. Kill the worker process (`Ctrl+C` or `docker compose stop worker`).
 4. Restart it.
 5. Send the `respond` request from above.
