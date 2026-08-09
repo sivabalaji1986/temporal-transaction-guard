@@ -363,7 +363,7 @@ If the score is at or above the threshold, the hold happens first, deliberately 
             investigation: InvestigationSummary = await workflow.execute_activity(
                 generate_explanation,
                 args=[transaction.fraud_score, transaction.trigger_reason],
-                start_to_close_timeout=timedelta(seconds=30),
+                start_to_close_timeout=timedelta(seconds=90),
                 retry_policy=RetryPolicy(
                     maximum_attempts=3, initial_interval=timedelta(seconds=1)
                 ),
@@ -787,7 +787,9 @@ Each of Temporal's core guarantees shows up as a specific, small piece of code i
 
 **Where:** `fraud_hold_workflow.py`, the `retry_policy=RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=1))` argument on the `generate_explanation` activity call.
 
-**What it does:** if `generate_explanation` fails, Temporal automatically retries it (up to 3 attempts total, at least 1 second apart) *without any retry loop written in this project's own code*. Every other activity call in this file has no explicit `retry_policy=`, which means it falls back to Temporal's default Activity retry policy rather than any specific fixed number of attempts. `generate_explanation` gets a deliberately small, explicit policy because it's the one call most likely to be genuinely flaky (a local AI model, possibly cold-starting) — in a real, production system, every activity would generally want its own deliberately chosen retry limit, timeout, and idempotency behavior, rather than being left on Temporal's defaults by accident; this demo mostly leans on the defaults for everything except this one call, for simplicity.
+**What it does:** if `generate_explanation` fails, Temporal automatically retries it (up to 3 attempts total, at least 1 second apart) *without any retry loop written in this project's own code*. Every other activity call in this file has no explicit `retry_policy=`, which means it falls back to Temporal's default Activity retry policy rather than any specific fixed number of attempts. `generate_explanation` gets a deliberately small, explicit policy because it's the one call most likely to be genuinely flaky (a local AI model — response time varies a lot run to run, and can be substantial depending on which model `OLLAMA_MODEL` points at) — in a real, production system, every activity would generally want its own deliberately chosen retry limit, timeout, and idempotency behavior, rather than being left on Temporal's defaults by accident; this demo mostly leans on the defaults for everything except this one call, for simplicity.
+
+**A concrete example of why this matters:** this call's `start_to_close_timeout` is 90 seconds — deliberately generous. It used to be 30 seconds, tuned around a smaller, faster default model. After switching the default `OLLAMA_MODEL`, direct timing showed single calls regularly taking 30-50+ seconds (this wasn't just a one-off "cold start" cost either — a second, back-to-back call on an already-loaded model took *longer* than the first). At 30 seconds, attempt 1 was timing out on essentially every real transaction, and the workflow only succeeded because the `RetryPolicy` above quietly absorbed a full, wasted retry cycle (and the extra latency that came with it) on every single hold. This is exactly the kind of thing Temporal's Event History makes visible that a normal application log might not: an `ActivityTaskStarted` event with `Attempt: 2`, and a `Last Failure` panel showing `"timeoutType": "TIMEOUT_TYPE_START_TO_CLOSE"` from attempt 1, tells you precisely what happened and when — open any workflow's Event History in the Temporal Web UI (`http://localhost:8233`) and look for the same pattern if you want to see it directly.
 
 ### 4.3 Signals
 

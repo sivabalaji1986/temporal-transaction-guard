@@ -75,7 +75,13 @@ class FraudHoldWorkflow:
             investigation: InvestigationSummary = await workflow.execute_activity(
                 generate_explanation,
                 args=[transaction.fraud_score, transaction.trigger_reason],
-                start_to_close_timeout=timedelta(seconds=30),
+                # 90s, not 30s: with the currently configured Ollama model,
+                # a single call can genuinely take 30-50+ seconds (measured
+                # directly, both cold and warm) -- 30s was tuned for a
+                # smaller/faster model and was timing out attempt 1 on
+                # essentially every real call, burning a full retry cycle
+                # (and ~30s of extra customer-facing latency) for no reason.
+                start_to_close_timeout=timedelta(seconds=90),
                 retry_policy=RetryPolicy(
                     maximum_attempts=3, initial_interval=timedelta(seconds=1)
                 ),
