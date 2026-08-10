@@ -1,11 +1,14 @@
-"""FraudHoldWorkflow orchestrates what happens after an existing fraud engine
-flags a transaction: a deterministic score check decides whether to place a
-hold; if held, the transaction is held immediately (so fund protection never
-waits on the LLM), then a pydantic-ai agent (via a local Ollama model)
-generates a customer-facing explanation and an internal ops summary -- falling
-back to a fixed, deterministic explanation instead of failing the workflow if
-that call exhausts its retries (e.g. Ollama is unreachable) -- the customer is
-notified, and the workflow durably waits up to 24 hours for the customer's
+"""FraudHoldWorkflow orchestrates what happens after an upstream fraud engine
+identifies a candidate transaction that may require further action and hands
+it off with a fraud score and trigger reason -- this workflow does not
+recompute that score. Its own deterministic threshold check decides whether
+to place a hold; if held, the transaction is held immediately (so fund
+protection never waits on the LLM), then a pydantic-ai agent (via a local
+Ollama model) generates a customer-facing explanation and an internal ops
+summary -- falling back to a fixed, deterministic explanation instead of
+failing the workflow if that call exhausts its retries (e.g. Ollama is
+unreachable) -- the customer is notified, and the workflow durably waits up
+to 24 hours for the customer's
 "it was me" / "not me" response -- resolving to release, block, or escalate on
 timeout. Because Temporal persists workflow progress independently of the
 worker process, this all resumes correctly even if the worker is killed and

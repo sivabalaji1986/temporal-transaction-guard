@@ -2,7 +2,7 @@
 
 A durable **hold → generate_explanation → notify → wait → resolve** workflow for suspicious transactions, built on [Temporal](https://temporal.io), [FastAPI](https://fastapi.tiangolo.com), [PydanticAI](https://ai.pydantic.dev), and a local [Ollama](https://ollama.com) model.
 
-> **What this project is *not*:** a fraud-detection engine. We assume a bank's existing fraud system has already flagged a transaction and handed it to us with a score and a reason. This project is only responsible for what happens *after* that: placing a hold, explaining it to the customer, waiting durably for a response, and resolving the case — correctly, even if a server crashes in the middle.
+> **What this project is *not*:** a fraud-detection engine. An upstream fraud engine doesn't send us every transaction — it identifies candidate transactions that may require further action and hands each one to us with a `fraudScore`, `triggerReason`, and `customerId`. We don't recompute or second-guess that score; we apply a simple deterministic hold policy on top of it (hold if the score is at/above a configured threshold, otherwise don't) and handle what happens *after* that decision: placing a hold, explaining it to the customer, waiting durably for a response, and resolving the case — correctly, even if a server crashes in the middle.
 
 ---
 
@@ -19,7 +19,7 @@ This repo is a small, runnable demonstration of that guarantee, applied to a bel
 ## Architecture
 
 ```
-Existing fraud engine flags transaction
+Upstream fraud engine identifies a candidate transaction
         |
         v
 POST /transactions/hold  (FastAPI)
@@ -73,7 +73,7 @@ Record no-hold outcome              Place temporary hold (Activity)
 
 - **The threshold check lives inside the Workflow, not an Activity.** It's pure logic over data already in workflow memory — no external call, no non-determinism — so it's safe to replay.
 - **Everything that touches the outside world is an Activity:** calling the LLM, placing a hold, sending a notification, releasing/blocking funds, logging the no-hold outcome. Activities are the only things that can fail, retry, and have side effects.
-- **The AI's job is explanation, not judgment.** The PydanticAI agent turns an already-computed fraud score and trigger reason into a structured, human-readable explanation and notification copy. It does **not** decide whether to hold — that decision is a deterministic threshold check the bank's own score already justifies. This keeps the article/demo focused on durable orchestration, not on whether an LLM makes good fraud judgments.
+- **The AI's job is explanation, not judgment.** The PydanticAI agent turns an already-computed fraud score and trigger reason into a structured, human-readable explanation and notification copy. It does **not** decide whether to hold — that decision is our own deterministic threshold check, applied to the score the upstream fraud engine already computed. This keeps the article/demo focused on durable orchestration, not on whether an LLM makes good fraud judgments.
 
 ### How this shows up in Temporal's Event History
 
@@ -154,7 +154,7 @@ temporal-transaction-guard/
 
 ## Input contract
 
-The fraud engine hands off a transaction like this:
+The upstream fraud engine doesn't hand us every transaction — only candidate transactions it flags as potentially needing further action, sent like this:
 
 ```json
 {
@@ -165,7 +165,7 @@ The fraud engine hands off a transaction like this:
 }
 ```
 
-`fraudScore` and `triggerReason` are treated as already-decided facts from an external system — this project doesn't recompute or second-guess them.
+`fraudScore` and `triggerReason` are treated as facts from an external system — this project doesn't recompute or second-guess the score itself. What it *does* decide, independently, is whether that score clears our own configured hold threshold; see [Architecture](#architecture) for that check.
 
 ---
 

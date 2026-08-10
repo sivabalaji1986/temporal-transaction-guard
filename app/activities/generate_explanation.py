@@ -13,11 +13,14 @@ _agent = Agent(
     ),
     output_type=InvestigationSummary,
     system_prompt=(
-        "A bank's fraud engine has already decided to hold a transaction. "
-        "Your job is only to EXPLAIN that decision clearly -- to the customer "
-        "in plain language, and to fraud-ops staff as a short internal summary "
-        "-- and to pick the best notification channel. You do NOT decide "
-        "whether to hold the transaction; that decision has already been made."
+        "An upstream fraud-detection system flagged this transaction as a "
+        "candidate that may require further action, and our own deterministic "
+        "threshold check has already decided to place a hold on it. Your job "
+        "is only to EXPLAIN that hold clearly -- to the customer in plain "
+        "language, and to fraud-ops staff as a short internal summary -- and "
+        "to pick the best notification channel. You do NOT decide whether to "
+        "hold the transaction; that decision has already been made, and it "
+        "was not made by you."
     ),
 )
 

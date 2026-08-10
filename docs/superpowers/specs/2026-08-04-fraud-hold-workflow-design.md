@@ -3,12 +3,23 @@
 ## Purpose
 
 A minimal, readable Python demo of Temporal's durable execution, applied to a banking
-fraud-hold scenario. An existing fraud engine has already scored a transaction and
-handed it off with a `fraudScore` and `triggerReason`. This project is only
-responsible for what happens next: decide whether to hold, explain the hold to the
-customer via a local LLM, notify them, wait durably for their response (with a
-timeout), and resolve the case. This is a teaching demo, not production code —
-every external effect is mocked with a print statement and a short sleep.
+fraud-hold scenario. The upstream fraud engine does not send every transaction — it
+identifies candidate transactions that may require further action and hands each one
+off with a `fraudScore`, `triggerReason`, and `customerId`. This project is not a
+fraud-detection engine and does not recompute that score. It is only responsible for
+applying a deterministic hold policy on top of it (hold at/above a configured
+threshold, otherwise don't) and, for held transactions, what happens next: explain
+the hold to the customer via a local LLM, notify them, wait durably for their
+response (with a timeout), and resolve the case. This is a teaching demo, not
+production code — every external effect is mocked with a print statement and a short
+sleep.
+
+> Narrative note (2026-08-10): this Purpose section was reworded post-launch to make
+> the upstream boundary explicit — the fraud engine identifies *candidates*, it does
+> not decide to hold; this project's threshold check is what decides that. The rest
+> of this spec (including embedded code snippets) reflects the design as of
+> 2026-08-04 and is intentionally left as a historical record — see `AGENTS.md` and
+> the current source for the up-to-date system prompt wording.
 
 ## Stack
 

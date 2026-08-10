@@ -8,7 +8,7 @@ This is **not** setup documentation — see `README.md` for how to install and r
 
 Before looking at a single line of code, here's the story of what happens, in plain English. Keep this narrative in your head — everything in the rest of this guide is just filling in *how* each step is actually written in Python.
 
-1. **An existing fraud engine flags a transaction and calls our API.** Somewhere else in the bank's systems, a fraud-detection engine (not part of this project) decides a transaction looks risky, and sends us a message: "here's a transaction, here's how risky we think it is, here's why." That message arrives as an HTTP request into `app/main.py`.
+1. **An upstream fraud engine identifies a candidate transaction and calls our API.** Somewhere else in the bank's systems, a fraud-detection engine (not part of this project) doesn't send us every transaction — only ones it flags as candidates that may require further action — and sends us a message: "here's a transaction, here's a score, here's why, here's who it belongs to." That message arrives as an HTTP request into `app/main.py`. We don't recompute that score; we just compare it to our own threshold in the next step.
 
 2. **`app/main.py` starts a Temporal workflow.** It doesn't do the fraud-hold logic itself — it just hands the transaction off to `app/workflows/fraud_hold_workflow.py` and asks Temporal to start running it.
 
@@ -249,11 +249,14 @@ _agent = Agent(
     ),
     output_type=InvestigationSummary,
     system_prompt=(
-        "A bank's fraud engine has already decided to hold a transaction. "
-        "Your job is only to EXPLAIN that decision clearly -- to the customer "
-        "in plain language, and to fraud-ops staff as a short internal summary "
-        "-- and to pick the best notification channel. You do NOT decide "
-        "whether to hold the transaction; that decision has already been made."
+        "An upstream fraud-detection system flagged this transaction as a "
+        "candidate that may require further action, and our own deterministic "
+        "threshold check has already decided to place a hold on it. Your job "
+        "is only to EXPLAIN that hold clearly -- to the customer in plain "
+        "language, and to fraud-ops staff as a short internal summary -- and "
+        "to pick the best notification channel. You do NOT decide whether to "
+        "hold the transaction; that decision has already been made, and it "
+        "was not made by you."
     ),
 )
 
