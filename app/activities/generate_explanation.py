@@ -1,8 +1,7 @@
-from temporalio import activity
-
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
+from temporalio import activity
 
 from app.config import settings
 from app.models import InvestigationSummary

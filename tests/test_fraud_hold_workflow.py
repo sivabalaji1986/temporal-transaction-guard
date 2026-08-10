@@ -1,6 +1,6 @@
 # tests/test_fraud_hold_workflow.py
 import uuid
-from typing import Callable
+from collections.abc import Callable
 
 import pytest
 from temporalio import activity

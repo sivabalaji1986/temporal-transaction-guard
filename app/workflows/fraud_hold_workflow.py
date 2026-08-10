@@ -12,7 +12,6 @@ worker process, this all resumes correctly even if the worker is killed and
 restarted mid-hold.
 """
 
-import asyncio
 from datetime import timedelta
 
 from temporalio import workflow
@@ -116,7 +115,7 @@ class FraudHoldWorkflow:
                 lambda: self._response is not None,
                 timeout=timedelta(hours=24),
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await workflow.execute_activity(
                 escalate,
                 transaction.transaction_id,
