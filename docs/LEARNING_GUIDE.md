@@ -142,7 +142,10 @@ from temporalio import activity
 
 @activity.defn
 async def record_no_hold_outcome(transaction_id: str, fraud_score: float) -> None:
-    print(f"[log_outcome] {transaction_id}: fraud_score={fraud_score} below threshold, no hold placed")
+    print(
+        f"[log_outcome] {transaction_id}: fraud_score={fraud_score} "
+        "below threshold, no hold placed"
+    )
     await asyncio.sleep(1)
 ```
 
@@ -233,11 +236,10 @@ Same pattern again. The one thing worth noting: this function takes *three* plai
 **Job:** The one activity that calls out to an AI model (via [PydanticAI](https://ai.pydantic.dev), talking to a locally-running [Ollama](https://ollama.com) model) to turn a fraud score and reason into human-readable text.
 
 ```python
-from temporalio import activity
-
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
+from temporalio import activity
 
 from app.config import settings
 from app.models import InvestigationSummary
@@ -410,7 +412,7 @@ Finally, the durable wait and resolution:
                 lambda: self._response is not None,
                 timeout=timedelta(hours=24),
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await workflow.execute_activity(
                 escalate,
                 transaction.transaction_id,
@@ -437,7 +439,7 @@ Finally, the durable wait and resolution:
 
 - **`workflow.wait_condition(lambda: self._response is not None, timeout=...)`** — pauses the workflow until the given condition becomes true, or the timeout expires. This is *durable* pausing: it isn't tying up a worker thread or keeping a process running the whole time — but its state is still durably stored by the Temporal server, which is exactly why it can survive a worker restart (see Section 4). It's simply recorded that this workflow is waiting, and it will be woken back up either when the `customer_responded` signal sets `self._response` (making the condition true) or when 24 hours pass.
 - **`lambda: self._response is not None`** — a `lambda` is a tiny, unnamed function written inline, used here because `wait_condition` needs *a function it can call repeatedly* to check the condition, not just a one-time value. `lambda: self._response is not None` means "a function with no arguments that returns whether `self._response` currently isn't `None`."
-- **`except asyncio.TimeoutError:`** — `wait_condition`'s timeout expiring raises this specific error, caught here to trigger the escalate path.
+- **`except TimeoutError:`** — `wait_condition`'s timeout expiring raises this specific error, caught here to trigger the escalate path. (This used to be written as `asyncio.TimeoutError` — as of Python 3.11, `asyncio.TimeoutError` is just an alias for the builtin `TimeoutError`, so `ruff` flags the qualified form as an unnecessary import and rewrites it to the plain builtin. Same error, same behavior.)
 - **`assert self._response is not None`** — a sanity check, not really "error handling": at this exact point in the code, we know `wait_condition` only returned normally (didn't raise `TimeoutError`) because the condition became true, so `self._response` genuinely can't be `None` here. `assert` documents that guarantee and would raise loudly if it were ever somehow wrong.
 
 **Calls out to:** `models.py` (for the data shapes), every activity file. **Called by:** `worker.py` (registers it), `main.py` (starts and signals it), `send_signal.py` (signals it), the tests (runs it directly).
@@ -638,7 +640,7 @@ if __name__ == "__main__":
 
 ```python
 import uuid
-from typing import Callable
+from collections.abc import Callable
 
 import pytest
 from temporalio import activity
@@ -689,7 +691,7 @@ def make_mock_activities(
 - **Closures** — `record_no_hold_outcome` and `generate_explanation` are defined *inside* `make_mock_activities`, and both refer to `calls` (and `notify_messages`), a variable that belongs to the outer function. This works because of a Python feature called a *closure*: an inner function can "remember" and modify variables from the function that defined it, even after that outer function returns. This is exactly how the tests can later inspect `calls` and see, after the fact, which activities actually ran.
 - **`generate_explanation_fails: bool = False`** — a function parameter with a default value. Most tests call `make_mock_activities()` with no arguments (using the default, `False` — the AI mock succeeds normally); one test (Section 5.7) calls `make_mock_activities(generate_explanation_fails=True)` to make the mock always fail instead, simulating an Ollama outage.
 - **`raise ValueError("simulated Ollama outage")`** — deliberately triggers an error, the same way `main.py` deliberately raises `HTTPException`. This is what eventually becomes the `ActivityError` that `fraud_hold_workflow.py`'s `except ActivityError:` catches (Section 2.7) — Temporal wraps whatever error an activity raises.
-- **`Callable` (from `typing`)** — a type hint meaning "any function." `list[Callable]` means "a list of functions" — used here because `make_mock_activities` returns the whole list of fake activity functions, ready to hand to a test `Worker`.
+- **`Callable` (from `collections.abc`)** — a type hint meaning "any function." `list[Callable]` means "a list of functions" — used here because `make_mock_activities` returns the whole list of fake activity functions, ready to hand to a test `Worker`. `Callable` used to live in `typing`; as of Python 3.9+, the standard-library convention moved these container/callable type hints to `collections.abc`, and `typing.Callable` is now just a deprecated alias for the same thing — `ruff` flags the old import path and rewrites it to this one.
 - **Tuples and unpacking** — `return calls, notify_messages, [...]` returns three things at once, bundled into a *tuple*. `calls, notify_messages, activities = make_mock_activities()` on the calling side is called *unpacking*: Python matches each name on the left to the corresponding item in the tuple on the right, in order.
 
 Here's one full test, showing the pattern every test follows:
@@ -802,7 +804,7 @@ Each of Temporal's core guarantees shows up as a specific, small piece of code i
 
 ### 4.4 Timeout
 
-**Where:** `fraud_hold_workflow.py`, the `timeout=timedelta(hours=24)` argument to `workflow.wait_condition(...)`, and the paired `except asyncio.TimeoutError:` block right after it.
+**Where:** `fraud_hold_workflow.py`, the `timeout=timedelta(hours=24)` argument to `workflow.wait_condition(...)`, and the paired `except TimeoutError:` block right after it.
 
 **What it does:** bounds how long the workflow will wait for a Signal before giving up and moving on (to `escalate`) on its own. Note this is a completely different mechanism from the `RetryPolicy` above — this isn't retrying anything, it's a maximum wait duration on a pause.
 
