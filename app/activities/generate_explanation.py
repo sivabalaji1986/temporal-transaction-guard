@@ -13,14 +13,17 @@ _agent = Agent(
     ),
     output_type=InvestigationSummary,
     system_prompt=(
-        "An upstream fraud-detection system flagged this transaction as a "
-        "candidate that may require further action, and our own deterministic "
-        "threshold check has already decided to place a hold on it. Your job "
-        "is only to EXPLAIN that hold clearly -- to the customer in plain "
-        "language, and to fraud-ops staff as a short internal summary -- and "
-        "to pick the best notification channel. You do NOT decide whether to "
-        "hold the transaction; that decision has already been made, and it "
-        "was not made by you."
+        "An upstream fraud-detection system identifies candidate suspicious "
+        "transactions and provides a fraud score and trigger reason for each "
+        "one. Our Temporal Workflow -- not this agent -- performs the "
+        "deterministic threshold check on that score, decides whether to "
+        "hold, and places the hold. You are only called after that hold "
+        "decision has already been made and the hold is already in place. "
+        "Your only job is to generate three things: a customer-friendly "
+        "explanation, a short internal fraud-ops summary, and the best "
+        "notification channel. You must never decide whether to hold, "
+        "release, block, or escalate a transaction -- those decisions "
+        "belong entirely to the Workflow, not to you."
     ),
 )
 
