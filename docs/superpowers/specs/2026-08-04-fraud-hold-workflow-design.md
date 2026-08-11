@@ -309,9 +309,9 @@ Temporal server or LLM, not to be a full suite.
 
 > Narrative note (2026-08-11): `generate_explanation` was later upgraded from a
 > single LLM call to a tool-using PydanticAI Agent (two read-only mock tools, an
-> explicit `usage_limits` bound), which added a sixth test-file,
-> `tests/test_generate_explanation_agent.py` (six Agent-level tests, using
-> `TestModel`/`FunctionModel` — no real Ollama), bringing the suite to 11 tests
+> explicit `usage_limits` bound), which added a second test file,
+> `tests/test_generate_explanation_agent.py` (seven Agent-level tests, using
+> `TestModel`/`FunctionModel` — no real Ollama), bringing the suite to 12 tests
 > total. The five tests described above are unchanged. See `AGENTS.md` and
 > `docs/LEARNING_GUIDE.md` Sections 2.6/2.12 for the current design and tests;
 > this section is left as a record of the 2026-08-04 scope.

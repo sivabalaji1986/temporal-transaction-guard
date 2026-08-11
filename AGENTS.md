@@ -45,9 +45,9 @@ activity logic. For a general walkthrough, see `README.md` and
    and re-check `start_to_close_timeout` in `fraud_hold_workflow.py`
    against the new worst case; don't just delete the limit.
 
-7. **All existing tests must stay green**, currently 11 across
+7. **All existing tests must stay green**, currently 12 across
    `tests/test_fraud_hold_workflow.py` (5, Workflow-level, mocked
-   activities) and `tests/test_generate_explanation_agent.py` (6, Agent-level,
+   activities) and `tests/test_generate_explanation_agent.py` (7, Agent-level,
    `TestModel`/`FunctionModel` — no real Ollama). Adding a new test for a
    real correctness gap is fine — just call it out explicitly rather than
    silently changing the expected test count, and don't add a test that

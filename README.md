@@ -220,13 +220,13 @@ Get the repo ready to work with, and confirm it's in a working state, before run
    pip install -r requirements.txt
    ```
 
-4. Run the test suite. This does **not** require Temporal, Docker, or Ollama to be running — all 11 tests use mocked activities, Temporal's in-memory time-skipping test environment, and PydanticAI's deterministic `TestModel`/`FunctionModel` test doubles instead of a real Ollama call:
+4. Run the test suite. This does **not** require Temporal, Docker, or Ollama to be running — all 12 tests use mocked activities, Temporal's in-memory time-skipping test environment, and PydanticAI's deterministic `TestModel`/`FunctionModel` test doubles instead of a real Ollama call:
 
    ```bash
    pytest tests/ -v
    ```
 
-   Expected: `11 passed` — 5 in `tests/test_fraud_hold_workflow.py` (Workflow-level orchestration, with the whole `generate_explanation` Activity mocked out) and 6 in `tests/test_generate_explanation_agent.py` (Agent-level: tool registration/calling, real tool-return-value influence on the final output, invalid-output rejection, no raw-data leakage, and the bounded tool-calling loop). If you instead see `ModuleNotFoundError: No module named 'temporalio'`, you're running `pytest` with a different Python than the one in `.venv` — check that `which python3` and `which pytest` both point inside `.venv/bin` (a common cause is running `pytest` via a system or IDE-default Python instead of the activated venv).
+   Expected: `12 passed` — 5 in `tests/test_fraud_hold_workflow.py` (Workflow-level orchestration, with the whole `generate_explanation` Activity mocked out) and 7 in `tests/test_generate_explanation_agent.py` (Agent-level: tool registration/calling, real tool-return-value influence on the final output, customer-scoped tool data via `ctx.deps`, invalid-output rejection, no raw-data leakage, and the bounded tool-calling loop). If you instead see `ModuleNotFoundError: No module named 'temporalio'`, you're running `pytest` with a different Python than the one in `.venv` — check that `which python3` and `which pytest` both point inside `.venv/bin` (a common cause is running `pytest` via a system or IDE-default Python instead of the activated venv).
 
 5. Copy the example environment file:
 
@@ -443,7 +443,7 @@ The workflow resumes from exactly where it paused and resolves the case correctl
 
 - Real fraud scoring — assumed to come from an existing system.
 - Real payment rails for hold/release/block — mocked for clarity.
-- Real customer-history/notification-preference systems — the Agent's two tools are mocked, read-only, and return fixed data.
+- Real customer-history/notification-preference systems — the Agent's two tools are mocked and read-only, returning customer-scoped data from small in-memory lookup dicts (keyed by `customer_id`, with a safe default for an unknown one) rather than calling a real system.
 - Multi-agent architectures, MCP, A2A, RAG/vector databases, or any other agent-framework machinery beyond a single tool-using PydanticAI Agent.
 - Auth, persistence beyond Temporal's own history, and production-grade error handling.
 
