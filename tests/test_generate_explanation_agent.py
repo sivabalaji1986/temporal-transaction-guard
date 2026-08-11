@@ -97,6 +97,54 @@ async def test_real_tool_return_value_influences_final_output():
 
 
 @pytest.mark.asyncio
+async def test_tool_results_are_scoped_by_customer_id_via_deps_only():
+    # Proves two things together:
+    # 1. Two different customer_id values genuinely receive different
+    #    scoped tool data -- not the same fixed mock regardless of who's
+    #    being investigated.
+    # 2. The model has no way to ask about a *different* customer: the
+    #    tool's schema (what the model actually sees) has no customer_id
+    #    parameter at all. The only customer_id a tool call can ever see is
+    #    whichever one this Activity was called with, via
+    #    `_agent.run(..., deps=customer_id)`.
+    def scripted_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        real_channel = _tool_result(messages, "lookup_customer_channel_preference")
+        if real_channel is not None:
+            output_tool = info.output_tools[0]
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=output_tool.name,
+                        args={
+                            "customer_explanation": "We paused this transaction for review.",
+                            "ops_summary": "Transaction flagged and held pending review.",
+                            "notification_type": real_channel,
+                        },
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[ToolCallPart(tool_name="lookup_customer_channel_preference", args={})]
+        )
+
+    with _agent.override(model=FunctionModel(scripted_model)):
+        result_101 = await generate_explanation(85, "UNUSUAL_LOCATION", "CUST-101")
+        result_202 = await generate_explanation(85, "UNUSUAL_LOCATION", "CUST-202")
+
+    # Two different customer_id values -> two genuinely different scoped
+    # results (CUST-101 -> "email", CUST-202 -> "push" in the mock data).
+    assert result_101.notification_type == "email"
+    assert result_202.notification_type == "push"
+    assert result_101.notification_type != result_202.notification_type
+
+    # The tool's schema has no customer_id parameter -- confirms the model
+    # itself never sees or supplies it, so it can't choose whose data to
+    # look up.
+    tool_def = _agent._function_toolset.tools["lookup_customer_channel_preference"].tool_def
+    assert "customer_id" not in tool_def.parameters_json_schema.get("properties", {})
+
+
+@pytest.mark.asyncio
 async def test_invalid_notification_type_is_rejected_not_silently_accepted():
     # notification_type is Literal["sms", "email", "push"]. A model that
     # insists on an out-of-range value should never produce a successful

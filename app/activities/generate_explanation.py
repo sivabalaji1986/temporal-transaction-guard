@@ -59,14 +59,35 @@ _agent = Agent(
 )
 
 
-@_agent.tool
-async def lookup_recent_transactions(ctx: RunContext[str]) -> list[dict[str, str | float]]:
-    """Read-only mock: this customer's recent transactions (merchant, amount, currency, country)."""
-    return [
+# Small, deterministic, in-memory mock data, keyed by customer_id -- stands
+# in for a real customer-history/preference lookup. An unknown customer_id
+# (not one of these keys) is a legitimate case, not an error, so both tools
+# fall back to a safe default instead of raising: an empty transaction list,
+# and an existing valid notification channel.
+_MOCK_RECENT_TRANSACTIONS: dict[str, list[dict[str, str | float]]] = {
+    "CUST-101": [
         {"merchant": "Acme Coffee", "amount": 4.50, "currency": "USD", "country": "US"},
         {"merchant": "Riverside Grocer", "amount": 62.10, "currency": "USD", "country": "US"},
         {"merchant": "Unnamed Kiosk", "amount": 310.00, "currency": "EUR", "country": "DE"},
-    ]
+    ],
+    "CUST-202": [
+        {"merchant": "Downtown Pharmacy", "amount": 18.25, "currency": "USD", "country": "US"},
+        {"merchant": "Lakeside Diner", "amount": 27.80, "currency": "USD", "country": "US"},
+    ],
+}
+
+_MOCK_CHANNEL_PREFERENCES: dict[str, Literal["sms", "email", "push"]] = {
+    "CUST-101": "email",
+    "CUST-202": "push",
+}
+
+_DEFAULT_CHANNEL_PREFERENCE: Literal["sms", "email", "push"] = "sms"
+
+
+@_agent.tool
+async def lookup_recent_transactions(ctx: RunContext[str]) -> list[dict[str, str | float]]:
+    """Read-only mock: this customer's recent transactions (merchant, amount, currency, country)."""
+    return _MOCK_RECENT_TRANSACTIONS.get(ctx.deps, [])
 
 
 @_agent.tool
@@ -74,7 +95,7 @@ async def lookup_customer_channel_preference(
     ctx: RunContext[str],
 ) -> Literal["sms", "email", "push"]:
     """Read-only mock: this customer's preferred notification channel."""
-    return "email"
+    return _MOCK_CHANNEL_PREFERENCES.get(ctx.deps, _DEFAULT_CHANNEL_PREFERENCE)
 
 
 @activity.defn
