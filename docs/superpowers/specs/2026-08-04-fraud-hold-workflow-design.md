@@ -307,6 +307,15 @@ cases, each short:
 This is meant to demonstrate the workflow is genuinely testable without a real
 Temporal server or LLM, not to be a full suite.
 
+> Narrative note (2026-08-11): `generate_explanation` was later upgraded from a
+> single LLM call to a tool-using PydanticAI Agent (two read-only mock tools, an
+> explicit `usage_limits` bound), which added a sixth test-file,
+> `tests/test_generate_explanation_agent.py` (six Agent-level tests, using
+> `TestModel`/`FunctionModel` — no real Ollama), bringing the suite to 11 tests
+> total. The five tests described above are unchanged. See `AGENTS.md` and
+> `docs/LEARNING_GUIDE.md` Sections 2.6/2.12 for the current design and tests;
+> this section is left as a record of the 2026-08-04 scope.
+
 ## Locked Decisions
 
 - Fraud score threshold: **70**.
@@ -318,6 +327,9 @@ Temporal server or LLM, not to be a full suite.
 ## Out of Scope
 
 No database, no auth, no real payment/notification integrations. The five
-workflow tests above are the extent of test coverage — no API-layer or
-activity-internals tests. README already documents the run/demo steps; this
-spec does not duplicate them.
+workflow tests above were, as of 2026-08-04, the extent of test coverage — no
+API-layer or activity-internals tests. (As the 2026-08-11 note above
+describes, activity-internals tests for the Agent were later added
+deliberately, to close a real coverage gap the Agent upgrade introduced — not
+as scope creep past this boundary.) README already documents the run/demo
+steps; this spec does not duplicate them.

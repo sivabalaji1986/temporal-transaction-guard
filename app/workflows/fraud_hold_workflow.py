@@ -3,12 +3,14 @@ identifies a candidate transaction that may require further action and hands
 it off with a fraud score and trigger reason -- this workflow does not
 recompute that score. Its own deterministic threshold check decides whether
 to place a hold; if held, the transaction is held immediately (so fund
-protection never waits on the LLM), then a pydantic-ai agent (via a local
-Ollama model) generates a customer-facing explanation and an internal ops
-summary -- falling back to a fixed, deterministic explanation instead of
-failing the workflow if that call exhausts its retries (e.g. Ollama is
-unreachable) -- the customer is notified, and the workflow durably waits up
-to 24 hours for the customer's
+protection never waits on the LLM), then a tool-using pydantic-ai Agent (via
+a local Ollama model) may gather read-only customer context before producing
+a customer-facing explanation and an internal ops summary -- the Agent never
+decides whether to hold, release, block, or escalate, only the Workflow does
+-- falling back to a fixed, deterministic explanation instead of failing the
+workflow if that call exhausts its retries (e.g. Ollama is unreachable) --
+the customer is notified, and the workflow durably waits up to 24 hours for
+the customer's
 "it was me" / "not me" response -- resolving to release, block, or escalate on
 timeout. Because Temporal persists workflow progress independently of the
 worker process, this all resumes correctly even if the worker is killed and
@@ -76,14 +78,21 @@ class FraudHoldWorkflow:
         try:
             investigation: InvestigationSummary = await workflow.execute_activity(
                 generate_explanation,
-                args=[transaction.fraud_score, transaction.trigger_reason],
-                # 90s, not 30s: with the currently configured Ollama model,
-                # a single call can genuinely take 30-50+ seconds (measured
-                # directly, both cold and warm) -- 30s was tuned for a
-                # smaller/faster model and was timing out attempt 1 on
-                # essentially every real call, burning a full retry cycle
-                # (and ~30s of extra customer-facing latency) for no reason.
-                start_to_close_timeout=timedelta(seconds=90),
+                args=[
+                    transaction.fraud_score,
+                    transaction.trigger_reason,
+                    transaction.customer_id,
+                ],
+                # 300s (5 min), not 90s: generate_explanation now runs a
+                # tool-using PydanticAI Agent, not one single model call. Its
+                # loop is explicitly bounded (see _AGENT_USAGE_LIMITS in
+                # generate_explanation.py: at most 6 model requests and 4
+                # tool calls). With the currently configured Ollama model, a
+                # single request has been measured taking 30-50+ seconds
+                # (cold or warm), so 6 requests worst-case is ~300s -- this
+                # timeout is sized to that bounded worst case, not picked
+                # arbitrarily.
+                start_to_close_timeout=timedelta(seconds=300),
                 retry_policy=RetryPolicy(
                     maximum_attempts=3, initial_interval=timedelta(seconds=1)
                 ),

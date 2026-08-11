@@ -16,7 +16,7 @@ Before looking at a single line of code, here's the story of what happens, in pl
 
 4. **If a hold is needed**, the workflow calls three things, one after another:
    - **`place_hold`** (in `hold.py`) — puts a temporary hold on the transaction.
-   - **`generate_explanation`** (in `generate_explanation.py`) — asks a local AI model (via PydanticAI and Ollama) to write a customer-friendly explanation and an internal summary.
+   - **`generate_explanation`** (in `generate_explanation.py`) — hands the case to a local AI **Agent** (via PydanticAI and Ollama). This isn't just one question-and-answer call: the Agent can decide, on its own, to call one or both of two small read-only lookup tools first (recent transactions, notification preference) before writing a customer-friendly explanation and an internal summary. Section 2.6 covers what makes this an *Agent* rather than a single LLM call, and exactly what it is and isn't allowed to do.
    - **`notify_customer`** (in `notify.py`) — sends that explanation to the customer.
 
 5. **The workflow then pauses — durably.** It waits for one of two things: the customer replying ("it was me" / "not me"), delivered as something Temporal calls a **Signal**, or 24 hours passing with no reply. "Durably" is the key word here: the workflow can sit in this paused state for hours or days, and it isn't tying up a worker thread or keeping a process running the whole time — but its state is still durably stored by the Temporal server for that entire time, which is exactly why it can survive a worker restart. We'll unpack exactly what that means in Section 4.
@@ -36,12 +36,13 @@ That's the whole system. Before diving into each file in detail, here's a quick-
 | `app/activities/log_outcome.py` | Activity | Below-threshold outcome (alternative to step 4) |
 | `app/activities/hold.py` | Activity | Place hold, release, block, escalate (steps 4, 8) |
 | `app/activities/notify.py` | Activity | Notify customer (step 4) |
-| `app/activities/generate_explanation.py` | Activity | Generate AI explanation (step 4) |
+| `app/activities/generate_explanation.py` | Activity | Tool-using AI Agent generates the explanation (step 4) |
 | `app/workflows/fraud_hold_workflow.py` | Workflow orchestration | Threshold check, activity calls, wait, resolve (steps 2–8) |
 | `app/worker.py` | Worker entrypoint | Actually executes the workflow + activities (step 6) |
 | `app/main.py` | FastAPI endpoints | Request in (steps 1–2), Signal in (step 7) |
 | `scripts/send_signal.py` | Standalone script | Signal in — an alternative path for step 7 |
 | `tests/test_fraud_hold_workflow.py` | Test | Exercises steps 2–8 without a real server or AI |
+| `tests/test_generate_explanation_agent.py` | Test | Exercises the Agent and its tools directly, without a real Ollama |
 
 Now let's go file by file and see how each piece of this is actually written.
 
@@ -233,16 +234,35 @@ Same pattern again. The one thing worth noting: this function takes *three* plai
 
 ### 2.6 `app/activities/generate_explanation.py` — **Activity**
 
-**Job:** The one activity that calls out to an AI model (via [PydanticAI](https://ai.pydantic.dev), talking to a locally-running [Ollama](https://ollama.com) model) to turn a fraud score and reason into human-readable text.
+**Job:** The one activity that hands the case to an AI **Agent** (via [PydanticAI](https://ai.pydantic.dev), talking to a locally-running [Ollama](https://ollama.com) model) to turn a fraud score and reason into human-readable text — and, unlike a single API call, lets that Agent decide for itself whether it needs to look up more context first.
+
+**What makes this an *Agent* rather than "just calling an LLM"?** A single LLM call is a one-shot round trip: you send a prompt, you get back text (or, with `output_type`, structured data), and that's the entire interaction — the model can't go do anything else in between. An **Agent** here means something more specific: the model is given a set of **tools** (real Python functions it can choose to invoke) and is allowed to keep going — call a tool, look at what it returned, decide whether it needs another tool or already has enough to answer, and only *then* produce its final structured output. The model itself decides how many of those turns it needs, if any. That decision-making loop — not the mere presence of an LLM — is what "agentic" means in this codebase, and it's why the locked principle for this file is **agentic investigation, deterministic action**: the Agent gets real autonomy over *how it investigates*, and zero autonomy over *what happens to the transaction*.
 
 ```python
-from pydantic_ai import Agent
+from typing import Literal
+
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.usage import UsageLimits
 from temporalio import activity
 
 from app.config import settings
 from app.models import InvestigationSummary
+
+# Bounds the Agent's tool-calling/reasoning loop for a single Activity
+# invocation. The normal path needs at most 3 model requests (decide to call
+# a tool, decide to call the other tool or go straight to output, produce the
+# final structured output) and 2 tool calls (one per read-only tool below).
+# request_limit=6 / tool_calls_limit=4 give roughly 2x headroom over that
+# normal path while still stopping a pathological tool loop well short of
+# consuming the whole Activity timeout. Exceeding either limit raises
+# pydantic_ai.exceptions.UsageLimitExceeded (verified against the installed
+# pydantic-ai-slim==2.22.0 wheel), which is just another Agent failure as far
+# as the Workflow is concerned -- it propagates the same way an Ollama outage
+# would, and is handled by the existing `except ActivityError` fallback in
+# fraud_hold_workflow.py.
+_AGENT_USAGE_LIMITS = UsageLimits(request_limit=6, tool_calls_limit=4)
 
 _agent = Agent(
     OpenAIChatModel(
@@ -250,6 +270,13 @@ _agent = Agent(
         provider=OpenAIProvider(base_url=settings.ollama_base_url, api_key="ollama"),
     ),
     output_type=InvestigationSummary,
+    # deps_type=str: the customer_id for the transaction under investigation.
+    # It's bound once via `_agent.run(deps=customer_id, ...)` below and read
+    # from RunContext.deps inside the tools -- never exposed as a tool
+    # parameter the model could fill in itself. This means the model can only
+    # ever look up the customer this Activity was actually called for, not an
+    # arbitrary customer_id of its choosing.
+    deps_type=str,
     system_prompt=(
         "An upstream fraud-detection system identifies candidate suspicious "
         "transactions and provides a fraud score and trigger reason for each "
@@ -257,37 +284,85 @@ _agent = Agent(
         "deterministic threshold check on that score, decides whether to "
         "hold, and places the hold. You are only called after that hold "
         "decision has already been made and the hold is already in place. "
-        "Your only job is to generate three things: a customer-friendly "
-        "explanation, a short internal fraud-ops summary, and the best "
-        "notification channel. You must never decide whether to hold, "
-        "release, block, or escalate a transaction -- those decisions "
-        "belong entirely to the Workflow, not to you."
+        "You may call your read-only tools, in any order, zero or more "
+        "times, to gather extra context about this customer before writing "
+        "your response -- for example their recent transaction activity or "
+        "their preferred notification channel. Your only job is to produce "
+        "three things: a customer-friendly explanation, a short internal "
+        "fraud-ops summary, and the best notification channel. You must "
+        "never decide whether to hold, release, block, or escalate a "
+        "transaction -- those decisions belong entirely to the Workflow, "
+        "not to you. The customer-facing explanation must stay concise and "
+        "appropriate for an end customer: never paste raw tool output, "
+        "internal identifiers, or other internal-only details directly "
+        "into it -- summarize what's relevant in plain language instead."
     ),
 )
 
 
+@_agent.tool
+async def lookup_recent_transactions(ctx: RunContext[str]) -> list[dict[str, str | float]]:
+    """Read-only mock: this customer's recent transactions (merchant, amount, currency, country)."""
+    return [
+        {"merchant": "Acme Coffee", "amount": 4.50, "currency": "USD", "country": "US"},
+        {"merchant": "Riverside Grocer", "amount": 62.10, "currency": "USD", "country": "US"},
+        {"merchant": "Unnamed Kiosk", "amount": 310.00, "currency": "EUR", "country": "DE"},
+    ]
+
+
+@_agent.tool
+async def lookup_customer_channel_preference(
+    ctx: RunContext[str],
+) -> Literal["sms", "email", "push"]:
+    """Read-only mock: this customer's preferred notification channel."""
+    return "email"
+
+
 @activity.defn
-async def generate_explanation(fraud_score: float, trigger_reason: str) -> InvestigationSummary:
+async def generate_explanation(
+    fraud_score: float, trigger_reason: str, customer_id: str
+) -> InvestigationSummary:
+    # Both tool calls (if the Agent makes them) and the final structured
+    # output happen inside this single Activity invocation -- see the module
+    # docstring note in fraud_hold_workflow.py and AGENTS.md for why a
+    # Temporal retry of this Activity re-runs the whole Agent loop, including
+    # any tool calls already made, and why that's safe here (the tools are
+    # read-only and idempotent).
     result = await _agent.run(
         f"fraud_score={fraud_score}, trigger_reason={trigger_reason}. "
-        "Write the customer_explanation, ops_summary, and notification_type."
+        "Gather any useful context via your tools, then write the "
+        "customer_explanation, ops_summary, and notification_type.",
+        deps=customer_id,
+        usage_limits=_AGENT_USAGE_LIMITS,
     )
     return result.output
 ```
 
 **New concepts, explained:**
 
-- **Module-level code that isn't inside a function** — the `_agent = Agent(...)` block runs *once*, the moment this file is first imported (same idea as `settings = Settings()` in `config.py`). It builds one `Agent` object and every call to `generate_explanation` reuses it, rather than rebuilding it from scratch on every call. The leading underscore in `_agent` is a Python convention meaning "this is private to this file, other files shouldn't reach in and use it directly" — it's not enforced by the language, just a signal to readers.
-- **`Agent(model, output_type=..., system_prompt=...)`** — this is PydanticAI's core building block: an `Agent` wraps a language model and, critically, `output_type=InvestigationSummary` tells PydanticAI "don't just give me back free text — force the model's answer into this exact Pydantic shape." This is why `InvestigationSummary` (defined in `models.py`) shows up here: the AI's raw response gets validated and structured into it automatically.
+- **Module-level code that isn't inside a function** — the `_agent = Agent(...)` block runs *once*, the moment this file is first imported (same idea as `settings = Settings()` in `config.py`). It builds one `Agent` object, registers its tools on it, and every call to `generate_explanation` reuses that same object rather than rebuilding it from scratch. The leading underscore in `_agent` is a Python convention meaning "this is private to this file, other files shouldn't reach in and use it directly" — it's not enforced by the language, just a signal to readers.
+- **`Agent(model, output_type=..., deps_type=..., system_prompt=...)`** — this is PydanticAI's core building block: an `Agent` wraps a language model and, critically, `output_type=InvestigationSummary` tells PydanticAI "don't just give me back free text — force the model's final answer into this exact Pydantic shape." `deps_type=str` declares that this Agent expects one piece of "dependency" data — here, the `customer_id` — that tools can read but the model itself never sees or supplies.
 - **`OpenAIChatModel` + `OpenAIProvider`** — Ollama exposes an API that's compatible with OpenAI's own API format, so PydanticAI can talk to it using its "OpenAI" support, just pointed at a different `base_url` (Ollama's local address instead of OpenAI's servers) with a throwaway `api_key` (Ollama doesn't check it).
-- **`await _agent.run(...)`** — actually sends the prompt and waits for (and validates) the response. `result.output` is the resulting `InvestigationSummary` object.
+- **What is a PydanticAI "tool"?** A tool is a normal Python `async def` function that you register on an `Agent` so the model can choose to call it *during* a run — a bounded, specific capability you hand the model, not a way for the model to run arbitrary code. It's not the same thing as an ordinary Python function call elsewhere in your app: the model only "knows about" a tool through a schema PydanticAI generates from its type hints (name, parameters, return type), and the model decides on its own, based on the conversation so far, whether calling it is useful.
+- **`@_agent.tool`** — the decorator that actually registers a function as one of `_agent`'s tools (same decorator pattern as `@activity.defn` in Section 2.3: it doesn't change what the function does when called directly, it attaches it to something else's system — here, the Agent's tool list, instead of Temporal's activity registry). PydanticAI also has `@_agent.tool_plain` for tools that don't need `RunContext`/`deps` at all; this project uses `@_agent.tool` for both tools because they read `ctx.deps` (the `customer_id`).
+- **`RunContext[str]`** — the first parameter of a context-aware tool. `ctx.deps` gives the tool access to whatever was passed as `deps=` to `_agent.run(...)` — here, the `customer_id` string. Because `ctx` isn't a normal argument the *model* fills in (PydanticAI excludes it from the tool's schema), the model can never choose or override which customer's data these tools look up — it can only ever investigate the customer this Activity was actually called for. That's a deliberate safety boundary, not an accident of the type system.
+- **How does the Agent decide when to call a tool, and what happens to the result?** After the initial prompt, PydanticAI sends the model the conversation so far plus the schemas of the registered tools. If the model's response is "call `lookup_recent_transactions`," PydanticAI actually runs that Python function, appends its return value to the conversation as a **tool result**, and sends the whole thing back to the model for another turn. This repeats — the model can call the same tool again, call the other tool, or stop and produce final output — until the model returns the final structured `InvestigationSummary` instead of another tool call. None of this looping is hand-written in `generate_explanation`; `await _agent.run(...)` is the one call that drives the entire back-and-forth and only returns once a final, schema-valid result exists.
+- **The two tools are deliberately read-only and return fixed mock data** — `lookup_recent_transactions` and `lookup_customer_channel_preference` don't call any real system; they always return the same small, hardcoded values. That's enough to prove the Agent can genuinely use tool results (see the tests in Section 2.12), without needing a real database or real customer-history API for this demo.
+- **Why do the tool calls stay inside this one Temporal Activity, instead of becoming separate Activities?** Because none of them have a side effect — they don't write anything, they're safe to call more than once, and calling them isn't expensive enough to be worth Temporal's own tracking overhead. Keeping them as plain Python function calls inside `generate_explanation` keeps the Workflow/Activity boundary simple: this Activity's job is still just "produce an `InvestigationSummary`," however many internal steps that takes.
+- **Why is it safe for a Temporal retry to repeat the whole Agent run, tool calls included?** If `generate_explanation` fails and Temporal retries it (see `RetryPolicy` in Section 2.7), the *entire* Activity function runs again from the top — including any tool calls the Agent already made on the failed attempt. That would be a real problem if a tool had a side effect (e.g. "send an SMS" called twice). It's safe here specifically *because* the tools are read-only: calling `lookup_recent_transactions` a second time just returns the same fixed data again, with no observable difference from calling it once. This is the same at-least-once-Activity-execution idea from Section 4.6, just applied one level deeper than before.
+- **Why can't the Agent perform an actual banking action?** Structurally, not just by instruction: the only tools registered on `_agent` are the two read-only lookups above. There is no `release`, `block`, `escalate`, or `place_hold` tool anywhere near the Agent's tool list — those functions live in `hold.py` and are only ever called directly by the *Workflow* (Section 2.7), never passed to `Agent(...)`. Even a fully "jailbroken" model talking to this Agent has nothing it could call to move money; the system prompt's instruction not to decide hold/release/block/escalate is reinforced by there being no capability to do so, not just a request not to.
+- **`UsageLimits(request_limit=6, tool_calls_limit=4)`** — the explicit bound on the Agent's loop, passed to `_agent.run(...)` as `usage_limits=`. Without it, a model that kept deciding "call one more tool" could in principle loop for a very long time, eating into (or exceeding) the Activity's `start_to_close_timeout`. `request_limit` caps how many separate calls to the model itself can happen in one run; `tool_calls_limit` caps how many tool invocations total. Exceeding either raises `pydantic_ai.exceptions.UsageLimitExceeded` — an ordinary exception that, inside a Temporal Activity, is just another way this Activity attempt can fail, handled the same as any other failure (see below).
+- **Keeping customer-facing text separate from internal context** — the system prompt explicitly tells the model to summarize what it learns from its tools in plain language for `customer_explanation`, and never to paste raw tool output or internal identifiers into it directly; `ops_summary` is where more internal detail belongs. This is a prompt-level instruction, not something the code enforces after the fact — `generate_explanation` returns whatever `InvestigationSummary` the model produced, unmodified. Section 2.12 covers how the tests build a *scripted* stand-in model to check this contract deterministically, and why that's a meaningfully different (and more limited) guarantee than "a live LLM will always comply."
+- **`await _agent.run(...)`** — actually drives the whole request/tool-call/response loop described above and waits for (and validates) the final response. `result.output` is the resulting `InvestigationSummary` object.
 - Notice this function returns `InvestigationSummary`, not `None` like every activity so far — activities can return real data, and Temporal will deliver that return value back to whatever workflow code called it (we'll see this land in a variable in Section 2.7).
-- **What happens to `ops_summary`?** The AI agent generates all three `InvestigationSummary` fields, including `ops_summary`, and it's genuinely present in this activity's result. But if you follow it forward into Section 2.7, you'll see the workflow only ever reads `investigation.customer_explanation` and `investigation.notification_type` when calling `notify_customer` — `ops_summary` isn't passed anywhere further in this demo. It exists as a hook for a future audit-log or internal-ops integration, not because anything in this project currently reads it.
+- **What happens to `ops_summary`?** The Agent generates all three `InvestigationSummary` fields, including `ops_summary`, and it's genuinely present in this activity's result. But if you follow it forward into Section 2.7, you'll see the workflow only ever reads `investigation.customer_explanation` and `investigation.notification_type` when calling `notify_customer` — `ops_summary` isn't passed anywhere further in this demo. It exists as a hook for a future audit-log or internal-ops integration, not because anything in this project currently reads it.
+
+**If you know Java:** think of `InvestigationSummary` the same way Section 2.1 described `Transaction` — roughly a DTO/record, but with runtime binding and validation built in rather than hand-written. `@_agent.tool` is conceptually similar to an annotation-based registration mechanism (like `@Component` making a Spring bean discoverable) in that it hands a piece of code over to a framework to manage — but a PydanticAI tool is not equivalent to ordinary autonomous application code you'd call yourself: it only ever runs when the *model* decides to call it, as one capability among a small, explicitly registered set, not as a general-purpose method the rest of your program can reach for.
 
 **Calls out to:** `app/config.py` (for the Ollama URL/model), `app/models.py` (for the `InvestigationSummary` shape); PydanticAI/Ollama externally.
 **Called by:** `fraud_hold_workflow.py`, `worker.py`.
 
-**Data flow:** in — `fraud_score`, `trigger_reason` (plain values). Out — a full `InvestigationSummary` object.
+**Data flow:** in — `fraud_score`, `trigger_reason`, `customer_id` (plain values; `customer_id` is new — see Section 2.7). Out — a full `InvestigationSummary` object.
 
 ---
 
@@ -300,7 +375,6 @@ async def generate_explanation(fraud_score: float, trigger_reason: str) -> Inves
 Let's look at the imports first:
 
 ```python
-import asyncio
 from datetime import timedelta
 
 from temporalio import workflow
@@ -370,8 +444,12 @@ If the score is at or above the threshold, the hold happens first, deliberately 
         try:
             investigation: InvestigationSummary = await workflow.execute_activity(
                 generate_explanation,
-                args=[transaction.fraud_score, transaction.trigger_reason],
-                start_to_close_timeout=timedelta(seconds=90),
+                args=[
+                    transaction.fraud_score,
+                    transaction.trigger_reason,
+                    transaction.customer_id,
+                ],
+                start_to_close_timeout=timedelta(seconds=300),
                 retry_policy=RetryPolicy(
                     maximum_attempts=3, initial_interval=timedelta(seconds=1)
                 ),
@@ -403,8 +481,9 @@ If the score is at or above the threshold, the hold happens first, deliberately 
 ```
 
 - **`try` / `except ActivityError:`** — this is Python's error-handling syntax, appearing here for the first time. Code inside `try:` runs normally; if it raises an *exception* (an error), instead of crashing the whole program, execution jumps straight to the matching `except` block. `except ActivityError:` specifically only catches Temporal's `ActivityError` — the error Temporal raises when an activity has *exhausted all its retries and given up* (here, after 3 attempts per the `RetryPolicy` above). Any other kind of error would still crash the workflow — this only handles this one specific, expected failure mode.
-- **`RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=1))`** — tells Temporal: if this activity fails, automatically try it again, up to 3 times total, waiting at least 1 second between attempts. This is entirely handled by Temporal — the workflow code doesn't write any retry loop itself.
-- **Why the fallback matters:** by this point, `place_hold` has already run — the transaction is genuinely on hold. If `generate_explanation` fails even after retries (say, Ollama isn't running) and that error were allowed to crash the workflow, the transaction would be stuck on hold forever with no notification and no way to resolve it, short of someone manually intervening in Temporal. Catching the error and substituting a fixed, generic `InvestigationSummary` means the rest of the flow (notify, wait, resolve) still runs normally either way.
+- **What can actually cause `generate_explanation` to fail now?** More things than before it became a tool-using Agent, but they're all still just "the Activity attempt raised an exception," so this one `except` still catches every case the same way: Ollama being unreachable, the model producing output that still doesn't match `InvestigationSummary` after PydanticAI's own internal retries, or the Agent's `usage_limits` bound (Section 2.6) being exceeded by a runaway tool-calling loop. The Workflow doesn't need to know or care which of these happened — only that the Activity, as a whole, didn't succeed after its retries.
+- **`RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=1))`** — tells Temporal: if this activity fails, automatically try it again, up to 3 times total, waiting at least 1 second between attempts. Since the whole Agent run (including any tool calls) lives inside this one Activity, each retry attempt re-runs the *entire* Agent loop from scratch — see Section 2.6 for why that's safe here. This is entirely handled by Temporal — the workflow code doesn't write any retry loop itself.
+- **Why the fallback matters:** by this point, `place_hold` has already run — the transaction is genuinely on hold. If `generate_explanation` fails even after retries (say, Ollama isn't running, or the Agent hits its execution bound) and that error were allowed to crash the workflow, the transaction would be stuck on hold forever with no notification and no way to resolve it, short of someone manually intervening in Temporal. Catching the error and substituting a fixed, generic `InvestigationSummary` means the rest of the flow (notify, wait, resolve) still runs normally either way.
 - Notice `investigation` ends up holding a real `InvestigationSummary` either way — either the AI's real one, or this hand-built fallback — and the `notify_customer` call right after doesn't know or care which.
 
 Finally, the durable wait and resolution:
@@ -639,7 +718,7 @@ if __name__ == "__main__":
 
 ### 2.11 `tests/test_fraud_hold_workflow.py` — **Test**
 
-**Job:** Five automated tests that exercise `FraudHoldWorkflow` end-to-end, without needing a real Temporal server, real activities, or a real Ollama running.
+**Job:** Five automated tests that exercise `FraudHoldWorkflow` end-to-end, without needing a real Temporal server, real activities, or a real Ollama running. (The full suite is 11 tests across two files — Section 2.12 covers the other six, which test the Agent inside `generate_explanation.py` directly.)
 
 ```python
 import uuid
@@ -668,7 +747,9 @@ def make_mock_activities(
         calls.append("record_no_hold_outcome")
 
     @activity.defn(name="generate_explanation")
-    async def generate_explanation(fraud_score: float, trigger_reason: str) -> InvestigationSummary:
+    async def generate_explanation(
+        fraud_score: float, trigger_reason: str, customer_id: str
+    ) -> InvestigationSummary:
         calls.append("generate_explanation")
         if generate_explanation_fails:
             raise ValueError("simulated Ollama outage")
@@ -690,7 +771,7 @@ def make_mock_activities(
 
 **New concepts, explained:**
 
-- **What is "mocking," and why replace real activities with fake ones?** A *mock* is a fake, simplified stand-in for a piece of real code, used in tests so you can check "did my logic call the right things, in the right order, with the right data?" without actually doing the real (slow, unpredictable, or expensive) thing. Here, the real `generate_explanation` activity calls an actual AI model — far too slow and non-deterministic for a fast automated test. So the tests define their *own* versions of every activity — matching names, matching signatures — that just record what happened (by appending to the shared `calls` list) instead of doing real work. Crucially, `@activity.defn(name="generate_explanation")` registers this fake function under the *same name* the real one uses — Temporal matches activities by name, so the workflow code doesn't need to know or care whether it's talking to the real activity or a test's stand-in.
+- **What is "mocking," and why replace real activities with fake ones?** A *mock* is a fake, simplified stand-in for a piece of real code, used in tests so you can check "did my logic call the right things, in the right order, with the right data?" without actually doing the real (slow, unpredictable, or expensive) thing. Here, the real `generate_explanation` activity runs a whole tool-using Agent that can talk to Ollama — far too slow and non-deterministic for a fast automated test. So the tests define their *own* versions of every activity — matching names, matching signatures — that just record what happened (by appending to the shared `calls` list) instead of doing real work. Notice this mock's signature — `(fraud_score, trigger_reason, customer_id)` — has to match the real Activity's three parameters (Section 2.6), but this file has no idea the real one is a whole Agent with tools; at this level, `generate_explanation` is just "a function with this signature that returns an `InvestigationSummary`," and swapping out *how* that value gets produced is exactly what Section 2.12's tests are for. Crucially, `@activity.defn(name="generate_explanation")` registers this fake function under the *same name* the real one uses — Temporal matches activities by name, so the workflow code doesn't need to know or care whether it's talking to the real activity or a test's stand-in.
 - **Closures** — `record_no_hold_outcome` and `generate_explanation` are defined *inside* `make_mock_activities`, and both refer to `calls` (and `notify_messages`), a variable that belongs to the outer function. This works because of a Python feature called a *closure*: an inner function can "remember" and modify variables from the function that defined it, even after that outer function returns. This is exactly how the tests can later inspect `calls` and see, after the fact, which activities actually ran.
 - **`generate_explanation_fails: bool = False`** — a function parameter with a default value. Most tests call `make_mock_activities()` with no arguments (using the default, `False` — the AI mock succeeds normally); one test (Section 5.7) calls `make_mock_activities(generate_explanation_fails=True)` to make the mock always fail instead, simulating an Ollama outage.
 - **`raise ValueError("simulated Ollama outage")`** — deliberately triggers an error, the same way `main.py` deliberately raises `HTTPException`. This is what eventually becomes the `ActivityError` that `fraud_hold_workflow.py`'s `except ActivityError:` catches (Section 2.7) — Temporal wraps whatever error an activity raises.
@@ -740,7 +821,35 @@ async def test_it_was_me_releases():
 
 ---
 
-### 2.12 The `__init__.py` files
+### 2.12 `tests/test_generate_explanation_agent.py` — **Test**
+
+**Job:** Six tests that exercise the Agent inside `generate_explanation.py` directly — calling `generate_explanation(...)` itself, not going through `FraudHoldWorkflow`/`Worker` at all — using PydanticAI's own deterministic test models instead of a real Ollama.
+
+**Why does this need a different approach than Section 2.11's tests?** Section 2.11's tests prove the *Workflow* behaves correctly by replacing the whole `generate_explanation` Activity with a simple fake function. That's the right tool for testing orchestration (does the Workflow call things in the right order, does it fall back correctly), but it can't tell you anything about the Agent's *internal* behavior — whether it actually registers its tools, whether a tool's real return value actually reaches the final answer, whether its execution bound actually stops a runaway loop. For that, these tests need to exercise the real `_agent` object from `generate_explanation.py`, just with its language model swapped out for something deterministic.
+
+```python
+from app.activities.generate_explanation import _agent, generate_explanation
+
+async def test_agent_can_invoke_both_read_only_tools():
+    with _agent.override(model=TestModel()):
+        result = await generate_explanation(85, "UNUSUAL_LOCATION", "CUST-101")
+    assert result.notification_type in {"sms", "email", "push"}
+```
+
+- **`_agent.override(model=...)`** — a context manager PydanticAI provides specifically for testing: inside the `with` block, `_agent` behaves exactly as it does in production (same tools, same `system_prompt`, same `output_type`, same `usage_limits` passed at call time) *except* its language model is temporarily replaced. Outside the block, `_agent` goes back to using the real Ollama-backed model. This is what makes it possible to test the actual, real `generate_explanation` function — the same one the Workflow calls in production — without ever needing Ollama running.
+- **`TestModel()`** — one of two deterministic stand-in "models" used here. By default, it calls *every* tool registered on the Agent once, then invents a schema-valid dummy value for each output field. That's enough to prove the tools are genuinely registered and callable, and that a schema-valid `InvestigationSummary` comes back — but its dummy values don't depend on what the tools actually returned, so it can't prove tool *results* influenced the answer.
+- **`FunctionModel(...)`** — the other stand-in, used in the other four tests. Instead of picking tool calls and output automatically, you hand it a plain Python function that receives the conversation so far and decides what the "model" does next — call a specific tool, or produce final output. This is what lets a test script an exact scenario: "call `lookup_customer_channel_preference`, read its *real* return value back out of the conversation, then use that real value when producing the final `InvestigationSummary`" — which is the only way to actually prove tool-result influence rather than just asserting a hardcoded expectation.
+- **Reading a tool's real result back out of the conversation** — when a tool runs, PydanticAI appends a `ToolReturnPart` (from `pydantic_ai.messages`) holding its return value to the message history before asking the "model" what to do next. A `FunctionModel` function can inspect that history directly, which is exactly how `test_real_tool_return_value_influences_final_output` proves the real `lookup_customer_channel_preference` tool's answer (`"email"`) — not a value the test invented — ends up as `result.notification_type`.
+- **Proving the invalid-output case fails loudly** — one test scripts a `FunctionModel` that always tries to return an out-of-range `notification_type` (`"carrier_pigeon"`, not `sms`/`email`/`push`). PydanticAI's own output validation retries once against the model, and since this scripted model never corrects itself, the run ultimately raises `pydantic_ai.exceptions.UnexpectedModelBehavior` — proving bad structured output can never quietly become a "successful" result.
+- **Proving the loop is bounded** — another test scripts a `FunctionModel` that always calls a tool again and never produces final output (a pathological loop). It asserts `pydantic_ai.exceptions.UsageLimitExceeded` is raised, using the *real*, imported `_AGENT_USAGE_LIMITS` from `generate_explanation.py` rather than reimplementing the bound in the test — so this test breaks loudly if someone changes the real limit without updating the test alongside it.
+- **An honest limitation, worth stating plainly:** the "no raw tool data leaks into `customer_explanation`" test scripts a *compliant* `FunctionModel` response (a clean summary, the behavior the system prompt asks for) and asserts the raw tool payload doesn't appear in it. That's a real regression test — it would catch a future code change that, say, dumped a tool's raw return value straight into `customer_explanation` — but it cannot prove a live LLM will always follow the system prompt's instruction, because in this test *the test itself* controls what the scripted model returns. Proving that against a real, non-scripted model is an evaluation concern, genuinely out of scope for this demo.
+
+**Calls out to:** `app/activities/generate_explanation.py` — this file exercises the *real* Agent, tools, and Activity function directly.
+**Called by:** nobody — run via `pytest`.
+
+---
+
+### 2.13 The `__init__.py` files
 
 `app/__init__.py`, `app/activities/__init__.py`, `app/workflows/__init__.py`, and `scripts/__init__.py` are all completely empty. These empty files explicitly mark these directories as regular Python packages — not strictly required in every modern Python setup (Python 3.3+ also supports "implicit namespace packages," folders with no `__init__.py` at all), but doing it explicitly here keeps imports and tooling behavior predictable, and is what makes writing `from app.activities.hold import place_hold` (instead of some more awkward path-based import) possible throughout this project. There's nothing to read inside them. (If you know Java: a Python package — a folder containing an `__init__.py` — plays roughly the same organizing role as a Java package, and `app.activities.hold` reads much like a Java package path such as `app.activities.hold`, just with dots instead of matching directory-and-namespace declarations.)
 
@@ -758,7 +867,7 @@ Now that every file and every concept has been introduced, let's trace two compl
 4. Separately, the **worker process** (running **`app/worker.py`**) — which has been polling the Temporal server the whole time — picks up the new workflow and starts executing **`app/workflows/fraud_hold_workflow.py`**, `FraudHoldWorkflow.run(...)`.
 5. Inside `run`: the threshold check (`transaction.fraud_score < fraud_score_threshold`) is false — a hold is needed.
 6. The workflow calls `place_hold` → the worker executes **`app/activities/hold.py`**, `place_hold(...)` — prints, sleeps 1 second.
-7. The workflow calls `generate_explanation` → the worker executes **`app/activities/generate_explanation.py`**, `generate_explanation(...)` — this succeeds, returning a real `InvestigationSummary`.
+7. The workflow calls `generate_explanation` (now passing `transaction.customer_id` too) → the worker executes **`app/activities/generate_explanation.py`**, `generate_explanation(...)`. Inside, `_agent.run(...)` may call `lookup_recent_transactions` and/or `lookup_customer_channel_preference` zero or more times (its own decision, bounded by `_AGENT_USAGE_LIMITS`) before producing a real `InvestigationSummary` — see Section 2.6 for the full tool-calling loop.
 8. The workflow calls `notify_customer` with that summary's fields → the worker executes **`app/activities/notify.py`**, `notify_customer(...)`.
 9. The workflow reaches `wait_condition(...)` and pauses — durably. At this point, even if the worker process were killed and restarted, the workflow would still be exactly here when it comes back (see Section 4.1).
 10. Later, a `POST /transactions/TXN-.../respond` request with `{"response": "it_was_me"}` arrives → **`app/main.py`**, `respond_to_transaction(...)`.
@@ -797,7 +906,7 @@ Each of Temporal's core guarantees shows up as a specific, small piece of code i
 
 **What it does:** if `generate_explanation` fails, Temporal automatically retries it (up to 3 attempts total, at least 1 second apart) *without any retry loop written in this project's own code*. Every other activity call in this file has no explicit `retry_policy=`, which means it falls back to Temporal's default Activity retry policy rather than any specific fixed number of attempts. `generate_explanation` gets a deliberately small, explicit policy because it's the one call most likely to be genuinely flaky (a local AI model — response time varies a lot run to run, and can be substantial depending on which model `OLLAMA_MODEL` points at) — in a real, production system, every activity would generally want its own deliberately chosen retry limit, timeout, and idempotency behavior, rather than being left on Temporal's defaults by accident; this demo mostly leans on the defaults for everything except this one call, for simplicity.
 
-**A concrete example of why this matters:** this call's `start_to_close_timeout` is 90 seconds — deliberately generous. It used to be 30 seconds, tuned around a smaller, faster default model. After switching the default `OLLAMA_MODEL`, direct timing showed single calls regularly taking 30-50+ seconds (this wasn't just a one-off "cold start" cost either — a second, back-to-back call on an already-loaded model took *longer* than the first). At 30 seconds, attempt 1 was timing out on essentially every real transaction, and the workflow only succeeded because the `RetryPolicy` above quietly absorbed a full, wasted retry cycle (and the extra latency that came with it) on every single hold. This is exactly the kind of thing Temporal's Event History makes visible that a normal application log might not: an `ActivityTaskStarted` event with `Attempt: 2`, and a `Last Failure` panel showing `"timeoutType": "TIMEOUT_TYPE_START_TO_CLOSE"` from attempt 1, tells you precisely what happened and when — open any workflow's Event History in the Temporal Web UI (`http://localhost:8233`) and look for the same pattern if you want to see it directly.
+**A concrete example of why this matters:** this call's `start_to_close_timeout` is 300 seconds (5 minutes) — deliberately generous, and deliberately tied to a specific number, not picked out of thin air. It was 90 seconds before `generate_explanation` became a tool-using Agent (and 30 seconds before that, tuned around an even smaller/faster default model — direct timing showed single Ollama calls regularly taking 30-50+ seconds with the model this project actually uses, not just as a one-off "cold start" cost). Now that a single Activity attempt can involve *up to* `_AGENT_USAGE_LIMITS.request_limit` (6) separate model requests — see Section 2.6 — the worst case is roughly 6 × 50s ≈ 300s, so the timeout was raised to match that bounded worst case rather than left at a number sized for one single call. If you raise the Agent's `request_limit`/`tool_calls_limit`, this timeout needs re-checking against the new worst case too — see the note in `AGENTS.md`. This is exactly the kind of thing Temporal's Event History makes visible that a normal application log might not: an `ActivityTaskStarted` event with `Attempt: 2`, and a `Last Failure` panel showing `"timeoutType": "TIMEOUT_TYPE_START_TO_CLOSE"` from attempt 1, tells you precisely what happened and when — open any workflow's Event History in the Temporal Web UI (`http://localhost:8233`) and look for the same pattern if you want to see it directly.
 
 ### 4.3 Signals
 
@@ -815,7 +924,7 @@ Each of Temporal's core guarantees shows up as a specific, small piece of code i
 
 **Where:** `fraud_hold_workflow.py`, the `try:` / `except ActivityError:` wrapped directly around the `generate_explanation` call.
 
-**What it does:** turns "the AI call failed even after every retry" from a workflow-ending crash into a handled, expected case — the workflow substitutes a fixed `InvestigationSummary` and continues exactly as if the AI call had succeeded, all the way through to the final resolution. See `tests/test_fraud_hold_workflow.py`'s `test_ai_failure_falls_back_and_still_resolves` (Section 5.7) for the automated proof that this actually works.
+**What it does:** turns "the Agent Activity failed even after every retry" — whether that's Ollama being unreachable, the model never producing valid structured output, or the Agent's `usage_limits` bound being exceeded (Section 2.6) — from a workflow-ending crash into a handled, expected case. The workflow substitutes a fixed `InvestigationSummary` and continues exactly as if the Agent had succeeded, all the way through to the final resolution. See `tests/test_fraud_hold_workflow.py`'s `test_ai_failure_falls_back_and_still_resolves` (Section 5.7) for the automated proof that this actually works.
 
 ### 4.6 Idempotency
 
@@ -835,7 +944,7 @@ Each of Temporal's core guarantees shows up as a specific, small piece of code i
 
 (Also covered in Section 2.11.) It's a temporary, isolated Temporal test environment with time-skipping enabled — a *simulated* clock that automatically fast-forwards whenever a test is just waiting for a result. Without it, `test_timeout_escalates` (below) would need to actually wait 24 real hours to pass.
 
-Now, the five tests themselves:
+Now, the five Workflow-level tests themselves (Section 5.8 below covers the other six, Agent-level tests):
 
 ### 5.3 `test_below_threshold_records_no_hold_outcome`
 
@@ -876,6 +985,19 @@ Now, the five tests themselves:
 **Asserts:** the result is still `"released"`; `"generate_explanation"` did run (it wasn't skipped — it was attempted and failed); `"notify_customer"` still ran; and, most specifically, the actual message captured in `notify_messages` is **not** the AI mock's normal success text (`"test explanation"`) and **does** contain `"temporarily paused"` — the exact fallback wording from `fraud_hold_workflow.py`.
 
 **What it proves:** this is the automated proof for Section 4.5 — that a total, repeated AI failure doesn't crash the workflow or leave the hold stuck, and that the customer genuinely receives the fallback message (not just that *some* message was sent).
+
+### 5.8 `tests/test_generate_explanation_agent.py` — the six Agent-level tests
+
+(Full walkthrough in Section 2.12; this is a quick-reference summary.) These six call `generate_explanation(...)` directly, swapping `_agent`'s model for `TestModel` or `FunctionModel` via `_agent.override(...)` — no Workflow, no Worker, no Ollama.
+
+| Test | What it proves |
+|---|---|
+| `test_agent_can_invoke_both_read_only_tools` | Both tools are genuinely registered and callable, and output stays schema-valid with tools in the loop. |
+| `test_real_tool_return_value_influences_final_output` | A tool's *actual* return value (not a value the test invented) flows into the final `InvestigationSummary` — the one thing `TestModel` alone can't prove. |
+| `test_invalid_notification_type_is_rejected_not_silently_accepted` | An out-of-range `notification_type` can never quietly succeed — PydanticAI's output validation retries, then raises. |
+| `test_customer_explanation_does_not_leak_raw_tool_data` | A compliant response keeps raw tool payload out of `customer_explanation` while allowing it in `ops_summary` — a regression guard and contract statement, not proof of live-model behavior (see Section 2.12's honesty note about this). |
+| `test_agent_loop_is_bounded` | A pathological, always-call-another-tool loop is actually stopped by the real, imported `_AGENT_USAGE_LIMITS` — not an unbounded loop. |
+| `test_tools_are_importable_and_registered` | The tool functions referenced throughout the tests and docs are the same ones actually registered on `_agent`. |
 
 ---
 

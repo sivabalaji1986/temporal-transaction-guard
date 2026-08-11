@@ -25,7 +25,9 @@ def make_mock_activities(
         calls.append("record_no_hold_outcome")
 
     @activity.defn(name="generate_explanation")
-    async def generate_explanation(fraud_score: float, trigger_reason: str) -> InvestigationSummary:
+    async def generate_explanation(
+        fraud_score: float, trigger_reason: str, customer_id: str
+    ) -> InvestigationSummary:
         calls.append("generate_explanation")
         if generate_explanation_fails:
             raise ValueError("simulated Ollama outage")
