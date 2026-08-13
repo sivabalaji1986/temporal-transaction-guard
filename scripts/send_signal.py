@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 
+from pydantic_ai.durable_exec.temporal import PydanticAIPlugin
 from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
 
@@ -11,7 +12,9 @@ from app.workflows.fraud_hold_workflow import FraudHoldWorkflow
 
 async def send_signal(transaction_id: str, response: str) -> None:
     client = await Client.connect(
-        settings.temporal_address, data_converter=pydantic_data_converter
+        settings.temporal_address,
+        data_converter=pydantic_data_converter,
+        plugins=[PydanticAIPlugin()],
     )
     handle = client.get_workflow_handle(transaction_id)
     await handle.signal(

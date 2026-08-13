@@ -1,8 +1,10 @@
 # temporal-transaction-guard
 
-A durable **hold → generate_explanation → notify → wait → resolve** workflow for suspicious transactions, built on [Temporal](https://temporal.io), [FastAPI](https://fastapi.tiangolo.com), a tool-using [PydanticAI](https://ai.pydantic.dev) Agent, and a local [Ollama](https://ollama.com) model.
+A durable **hold → investigate → notify → wait → resolve** workflow for suspicious transactions, built on [Temporal](https://temporal.io), [FastAPI](https://fastapi.tiangolo.com), a tool-using [PydanticAI](https://ai.pydantic.dev) Agent running through PydanticAI's `TemporalDurability` capability, and a local [Ollama](https://ollama.com) model.
 
 > **Agentic investigation, deterministic action.** The AI Agent may autonomously gather additional read-only context before writing its explanation, but it never decides whether to hold, release, block, or escalate a transaction — that stays entirely in the Temporal Workflow.
+
+> **Fine-grained durability.** The Agent's `agent.run(...)` call executes directly inside the Workflow. Each individual model request and each individual tool call becomes its own Temporal Activity, separately recorded in Event History — not one opaque Activity containing the whole investigation. A Worker failure partway through an investigation does not force the whole thing to restart: whatever model/tool steps already completed are preserved and are not re-executed on resume, only the interrupted step retries. See [Before / after this migration](#before--after-this-migration) below.
 
 > **What this project is *not*:** a fraud-detection engine. An upstream fraud engine doesn't send us every transaction — it identifies candidate transactions that may require further action and hands each one to us with a `fraudScore`, `triggerReason`, and `customerId`. We don't recompute or second-guess that score; we apply a simple deterministic hold policy on top of it (hold if the score is at/above a configured threshold, otherwise don't) and handle what happens *after* that decision: placing a hold, explaining it to the customer, waiting durably for a response, and resolving the case — correctly, even if a server crashes in the middle.
 
@@ -43,27 +45,37 @@ Record no-hold outcome              Place temporary hold (Activity)
                                         must not wait on the LLM below
                                                 |
                                                 v
-                                     PydanticAI Agent Activity:
-                                     - may call lookup_recent_transactions()
-                                     - may call lookup_customer_channel_
-                                       preference()
-                                       (both read-only, mocked, optional --
-                                        the Agent decides if/when to call
-                                        them, bounded by an explicit
-                                        request/tool-call limit)
-                                     - reasons over whatever it gathered
-                                     - produces InvestigationSummary:
-                                       customer-friendly explanation,
-                                       operations summary, notification type
-                                     (single Activity, calls local Ollama
-                                      model; a retry re-runs the whole Agent
-                                      loop incl. any tool calls -- safe
-                                      because the tools are read-only)
+                                     agent.run(...) -- executes directly in
+                                     Workflow code (PydanticAIWorkflow +
+                                     TemporalDurability), fanning out into
+                                     separate Temporal Activities:
+                                        Model request Activity (turn 1)
+                                                |
+                                                v
+                                        Tool call Activity(s), 0+ of:
+                                        - lookup_recent_transactions()
+                                        - lookup_customer_channel_
+                                          preference()
+                                          (both read-only, mocked; the
+                                           Agent decides if/when to call
+                                           them, bounded by an explicit
+                                           request/tool-call limit)
+                                                |
+                                                v
+                                        Model request Activity (final turn)
+                                        -> InvestigationSummary: customer-
+                                           friendly explanation, operations
+                                           summary, notification type
+                                     <- each of these is an independently
+                                        durable Activity: if one fails and
+                                        retries, already-completed earlier
+                                        steps are NOT re-executed
                                      <- falls back to a fixed, deterministic
                                         explanation instead of failing the
-                                        workflow if this fails after retries
-                                        (e.g. Ollama is unreachable, or the
-                                        Agent's execution bound is hit)
+                                        workflow if the Agent fails after
+                                        retries (e.g. Ollama is unreachable,
+                                        or the Agent's execution bound is
+                                        hit)
                                                 |
                                                 v
                                      Notify customer (Activity)
@@ -86,18 +98,55 @@ Record no-hold outcome              Place temporary hold (Activity)
 ### Design rules this project follows
 
 - **The threshold check lives inside the Workflow, not an Activity.** It's pure logic over data already in workflow memory — no external call, no non-determinism — so it's safe to replay.
-- **Everything that touches the outside world is an Activity:** calling the LLM (and its tools), placing a hold, sending a notification, releasing/blocking funds, logging the no-hold outcome. Activities are the only things that can fail, retry, and have side effects.
-- **Agentic investigation, deterministic action.** The PydanticAI Agent inside `generate_explanation` may call two read-only tools — `lookup_recent_transactions` and `lookup_customer_channel_preference` — to gather extra context about the customer before writing its response. It decides for itself whether, and in what order, to call them. What it can **never** do is decide whether to hold, release, block, or escalate, recompute the fraud score, or call a write-side/banking tool — those stay entirely in the Workflow and its other Activities. This keeps the demo focused on durable orchestration around a genuinely agentic AI component, without letting the AI touch anything that actually moves money.
-- **The Agent's tools are read-only, and both live inside the single `generate_explanation` Activity** — they are not separate Temporal Activities. This means a Temporal retry of `generate_explanation` re-runs the *entire* Agent loop, including any tool calls already made. That's only safe because the tools are read-only and naturally idempotent (looking up the same customer's data twice has no side effect); a future tool with a real side effect would need its own Activity boundary instead.
-- **The Agent's tool-calling loop is explicitly bounded**, not left to run indefinitely. `generate_explanation.py` passes `usage_limits=UsageLimits(request_limit=6, tool_calls_limit=4)` to the Agent run — roughly double the normal path's expected 3 requests / 2 tool calls, but still far short of unbounded — so a pathological loop can't consume the whole Activity timeout. Exceeding either limit is just another Agent failure, handled by the same deterministic fallback described below.
+- **Everything that touches the outside world is an Activity:** every LLM request, every tool call, placing a hold, sending a notification, releasing/blocking funds, logging the no-hold outcome. Activities are the only things that can fail, retry, and have side effects. `agent.run(...)` itself executes as Workflow code, but every piece of actual I/O it does is wrapped in its own Activity by `TemporalDurability` — the Workflow code stays deterministic.
+- **Agentic investigation, deterministic action.** The PydanticAI Agent (`app/activities/generate_explanation.py`) may call two read-only tools — `lookup_recent_transactions` and `lookup_customer_channel_preference` — to gather extra context about the customer before writing its response. It decides for itself whether, and in what order, to call them. What it can **never** do is decide whether to hold, release, block, or escalate, recompute the fraud score, or call a write-side/banking tool — those stay entirely in the Workflow and its other Activities. This keeps the demo focused on durable orchestration around a genuinely agentic AI component, without letting the AI touch anything that actually moves money.
+- **The Agent has a stable, explicit name (`fraud_hold_investigator`), and its built-in tool registry has a stable, framework-fixed ID (`<agent>`).** Both become part of the Temporal Activity names in-flight Workflow histories depend on (e.g. `agent__fraud_hold_investigator__model_request`) — treat them as durable contracts, not casually renameable. See `AGENTS.md`.
+- **The Agent's tools stay read-only.** Because each model request and each tool call is now its own Temporal Activity, a retry only re-runs the *one* step that failed — not the whole investigation. That's still only safe because the tools are read-only and naturally idempotent (looking up the same customer's data twice has no side effect); a future tool with a real side effect would need careful thought, not just "add another `@_agent.tool`."
+- **The Agent's tool-calling loop is explicitly bounded**, not left to run indefinitely. `generate_explanation.py` passes `usage_limits=UsageLimits(request_limit=6, tool_calls_limit=4)` to the Agent run — roughly double the normal path's expected 3 requests / 2 tool calls, but still far short of unbounded. Each individual model/tool Activity also has an explicit, bounded `start_to_close_timeout` and `retry_policy` (Temporal's own default retry policy is *unlimited* attempts, so this has to be set explicitly) — see [Timeout and retry budget](#timeout-and-retry-budget) below for the full worst-case calculation. Exceeding the usage-limits bound is just another Agent failure, handled by the same deterministic fallback described below.
 - **Customer-facing text must summarize, not leak, internal context.** The Agent's system prompt explicitly instructs it to turn whatever it gathers (recent transactions, channel preference, the raw trigger reason) into a plain-language `customer_explanation` — never to paste raw tool output or internal identifiers into it. `ops_summary` is the place for more internal detail.
+
+### Timeout and retry budget
+
+Every model-request and tool-call Activity has an explicit `start_to_close_timeout` and `retry_policy` (`generate_explanation.py`'s `_BASE_ACTIVITY_CONFIG`/`_MODEL_ACTIVITY_CONFIG`), chosen deliberately rather than left on Temporal's default (unlimited attempts):
+
+| | `start_to_close_timeout` | `maximum_attempts` |
+|---|---|---|
+| Model-request Activity | 60s | 2 |
+| Tool-call Activity | 10s | 2 |
+
+**Worst-case Agent-phase budget** (the maximum path permitted by `UsageLimits(request_limit=6, tool_calls_limit=4)`, assuming every single invocation fails once and retries):
+- Model: 6 × (60s + 1s backoff + 60s) = 726s
+- Tools: 4 × (10s + 1s backoff + 10s) = 84s
+- **Total: 810s**, comfortably under a 900s (15 minute) ceiling.
+
+The 60s model-request timeout isn't a guess: real local measurement (this repo's configured default, `qwen3.5:latest`, forced to a genuine cold start, with the actual system prompt and tool schemas) showed a worst observed latency of **17.1 seconds** across multiple trials — 60s gives roughly 3.5x headroom over that. Two attempts per step, not three, is a deliberate tradeoff: the fine-grained design's *aggregate* retry opportunity across a full investigation is actually higher than before it became fine-grained (up to 6 × 2 = 12 possible model-request attempts across a run, versus 3 attempts total for the old single opaque Activity), even though any one step gets fewer attempts than before.
+
+If you change `UsageLimits` or either activity config, recalculate this budget — don't just widen a number without checking the total.
+
+### Before / after this migration
+
+```text
+Before:
+  generate_explanation = one Activity
+  failure midway -> entire Agent loop retries
+
+After:
+  agent.run() executes in the Workflow
+  model/tool I/O = separate Temporal Activities
+  completed Activity results remain in Event History
+  replay continues using those durable results
+```
+
+This project originally ran the whole investigation as one hand-written `@activity.defn async def generate_explanation(...)` function that called `_agent.run(...)` internally — a coarse boundary where any failure meant Temporal retried the *entire* loop, tool calls included. It now uses PydanticAI's `TemporalDurability` capability plus `PydanticAIWorkflow`/`PydanticAIPlugin`, so `agent.run(...)` executes directly as Workflow code and each model request and tool call becomes its own Activity automatically. `TemporalAgent` (an older, now-deprecated PydanticAI wrapper) is deliberately not used — see `AGENTS.md`.
+
+If you're picking this repo up mid-history: local Temporal dev-server state from before this migration doesn't replay against the new Workflow shape. Wipe it (`docker compose down -v`, or just don't reuse an old `temporal server start-dev`'s data directory) before running the migrated code — this is a small learning/demo repo, so a clean-slate restart is the deliberate choice here rather than a production-grade versioning strategy.
 
 ### How this shows up in Temporal's Event History
 
 Open any workflow in the Temporal Web UI (`http://localhost:8233`) and click its **Event History** tab, and you'll see a repeating pattern rather than one line per activity. That's expected — here's how to read it:
 
-- **Workflow Task** — the worker waking up to run/replay `FraudHoldWorkflow.run` up to its next decision point, then going back to sleep. Every activity call, every signal, and the timer firing/being canceled each trigger one of these. Recorded as 3 events: `WorkflowTaskScheduled` → `WorkflowTaskStarted` → `WorkflowTaskCompleted`.
-- **Activity Task** — the actual execution of one activity (`place_hold`, `generate_explanation`, `notify_customer`, `release`/`block`/`escalate`). Also 3 events — `ActivityTaskScheduled` → `ActivityTaskStarted` → `ActivityTaskCompleted` — plus one extra `ActivityTaskStarted` per retry attempt if it fails and gets retried (check the `Attempt` field, and `Last Failure` on that event for why the previous attempt didn't succeed).
+- **Workflow Task** — the worker waking up to run/replay `FraudHoldWorkflow.run` up to its next decision point, then going back to sleep. Every activity call (including each individual model/tool call the Agent makes), every signal, and the timer firing/being canceled each trigger one of these. Recorded as 3 events: `WorkflowTaskScheduled` → `WorkflowTaskStarted` → `WorkflowTaskCompleted`.
+- **Activity Task** — the actual execution of one activity. Most are familiar (`place_hold`, `notify_customer`, `release`/`block`/`escalate`), but the Agent investigation now fans out into several, individually named and individually tracked: `agent__fraud_hold_investigator__model_request` (once per model turn — typically twice: decide whether to call a tool, then produce the final structured output) and `agent__fraud_hold_investigator__toolset__<agent>__call_tool` (once per tool call the Agent actually makes, zero or more). Each is 3 events — `ActivityTaskScheduled` → `ActivityTaskStarted` → `ActivityTaskCompleted` — plus one extra `ActivityTaskStarted` per retry attempt if it fails and gets retried (check the `Attempt` field, and `Last Failure` on that event for why the previous attempt didn't succeed, and the `Identity` field for which Worker container handled it — see [Demo C](#demo-c--worker-pod-failover-during-durable-agent-execution)).
 - **Timer** — the durable 24h wait: `TimerStarted` when `wait_condition`'s timeout kicks in, then either `TimerCanceled` (a signal arrived first) or `TimerFired` (24h passed with no response).
 - **Signal** — `WorkflowExecutionSignaled` the moment `/respond` (or `send_signal.py`) delivers `customer_responded`.
 - **Completion** — `WorkflowExecutionCompleted`, the terminal event, carrying the final result string.
@@ -108,8 +157,12 @@ Stacked together, an above-threshold hold that gets resolved via signal looks li
 WorkflowExecutionStarted
   Workflow Task  -> decide: call place_hold
   Activity Task: place_hold
-  Workflow Task  -> decide: call generate_explanation
-  Activity Task: generate_explanation
+  Workflow Task  -> decide: model request (turn 1: decide whether to call a tool)
+  Activity Task: agent__fraud_hold_investigator__model_request
+  Workflow Task  -> decide: call a tool
+  Activity Task: agent__fraud_hold_investigator__toolset__<agent>__call_tool
+  Workflow Task  -> decide: model request (final turn: produce InvestigationSummary)
+  Activity Task: agent__fraud_hold_investigator__model_request
   Workflow Task  -> decide: call notify_customer
   Activity Task: notify_customer
   Workflow Task  -> decide: start the 24h wait
@@ -124,7 +177,7 @@ WorkflowExecutionStarted
   WorkflowExecutionCompleted ("released")
 ```
 
-Since each "Workflow Task" and "Activity Task" line above is really 3 history events, a single resolved hold typically ends up as ~30-35 total events. That's normal, not a sign anything's wrong — every one of those events is a durability checkpoint permanently recorded by the Temporal *server*, independent of the worker process. That's exactly why killing and restarting the worker mid-hold (see [the crash-resume demo](#the-crash-resume-demo) below) doesn't lose any progress: a new worker just picks up where this history left off.
+Since each "Workflow Task" and "Activity Task" line above is really 3 history events, a single resolved hold now typically ends up as ~45-55 total events (more than before this migration, since the investigation is no longer one opaque Activity — this is the visible cost of the finer-grained durability). That's normal, not a sign anything's wrong — every one of those events is a durability checkpoint permanently recorded by the Temporal *server*, independent of the worker process. That's exactly why killing and restarting the worker mid-hold (see [Demo A](#demo-a--business-workflow-durability) and [Demo C](#demo-c--worker-pod-failover-during-durable-agent-execution) below) doesn't lose any progress: a new worker just picks up where this history left off.
 
 ---
 
@@ -134,8 +187,8 @@ Since each "Workflow Task" and "Activity Task" line above is really 3 history ev
 |---|---|
 | **FastAPI (`app/main.py`)** | Entry and exit point. `POST /transactions/hold` receives the handoff from the fraud engine and starts a workflow — resubmitting the same `transaction_id` (whether still running or already completed) returns `{"status": "already_started"}` instead of starting a duplicate. `POST /transactions/{id}/respond` delivers the customer's response as a Temporal Signal, returning a 404 if `transaction_id` doesn't match a known workflow. |
 | **Workflow (`app/workflows/fraud_hold_workflow.py`)** | Orchestrates the whole case: threshold check, activity calls, the durable wait with timeout, and the final branch (release / block / escalate). |
-| **Activities (`app/activities/`)** | `generate_explanation.py` (a tool-using PydanticAI Agent talking to Ollama — may call two read-only mock tools, bounded by an explicit request/tool-call limit; falls back to a fixed explanation instead of failing the workflow if the call fails after retries), `hold.py` (place hold / release / block / escalate), `notify.py` (customer notification), `log_outcome.py` (no-hold logging). All mocked for the demo — swap in real integrations later. |
-| **Worker (`app/worker.py`)** | Connects to the Temporal server, registers the workflow and activities, and executes tasks from the queue. This is the process we deliberately kill mid-demo. |
+| **Activities (`app/activities/`)** | `generate_explanation.py` defines the PydanticAI Agent (talking to Ollama, `capabilities=[TemporalDurability(...)]`) and its two read-only mock tools — its model requests and tool calls become Temporal Activities automatically, not via a hand-written `@activity.defn` wrapper. Falls back to a fixed explanation instead of failing the workflow if the investigation fails after retries. `hold.py` (place hold / release / block / escalate), `notify.py` (customer notification), `log_outcome.py` (no-hold logging) are plain, hand-written Activities. All mocked for the demo — swap in real integrations later. |
+| **Worker (`app/worker.py`)** | Connects to the Temporal server (with `plugins=[PydanticAIPlugin()]`, and an explicit `identity=` built from the container hostname), registers the workflow and its plain activities, and executes tasks from the queue. `PydanticAIPlugin` auto-registers the Agent's model/tool activities by reading `FraudHoldWorkflow.__pydantic_ai_agents__` — no manual registration needed for those. This is the process we deliberately kill mid-demo (Demo A and Demo C below) — and the one you scale to 2 replicas for Demo C. |
 | **`scripts/send_signal.py`** | Simulates a customer replying, independent of the FastAPI process — useful for testing signal delivery directly. |
 
 ---
@@ -162,17 +215,18 @@ temporal-transaction-guard/
 │   ├── config.py
 │   ├── worker.py
 │   ├── workflows/
-│   │   └── fraud_hold_workflow.py
+│   │   └── fraud_hold_workflow.py         # PydanticAIWorkflow + __pydantic_ai_agents__
 │   └── activities/
-│       ├── generate_explanation.py    # tool-using PydanticAI Agent
+│       ├── generate_explanation.py        # Agent + TemporalDurability + tools
 │       ├── hold.py
 │       ├── notify.py
 │       └── log_outcome.py
 ├── scripts/
 │   └── send_signal.py
 └── tests/
-    ├── test_fraud_hold_workflow.py         # Workflow-level, mocked activities
-    └── test_generate_explanation_agent.py  # Agent-level, TestModel/FunctionModel
+    ├── test_fraud_hold_workflow.py              # Workflow-level: monkeypatch + UnsandboxedWorkflowRunner
+    ├── test_generate_explanation_agent.py       # Agent-level, outside a Workflow (transparent)
+    └── test_generate_explanation_agent_durability.py  # fine-grained Activity fan-out + replay
 ```
 
 ---
@@ -220,13 +274,18 @@ Get the repo ready to work with, and confirm it's in a working state, before run
    pip install -r requirements.txt
    ```
 
-4. Run the test suite. This does **not** require Temporal, Docker, or Ollama to be running — all 12 tests use mocked activities, Temporal's in-memory time-skipping test environment, and PydanticAI's deterministic `TestModel`/`FunctionModel` test doubles instead of a real Ollama call:
+4. Run the test suite. This does **not** require Temporal, Docker, or Ollama to be running — all 15 tests use mocked activities, Temporal's in-memory time-skipping test environment, `UnsandboxedWorkflowRunner` where needed for monkeypatching, and PydanticAI's deterministic `TestModel`/`FunctionModel` test doubles instead of a real Ollama call:
 
    ```bash
    pytest tests/ -v
    ```
 
-   Expected: `12 passed` — 5 in `tests/test_fraud_hold_workflow.py` (Workflow-level orchestration, with the whole `generate_explanation` Activity mocked out) and 7 in `tests/test_generate_explanation_agent.py` (Agent-level: tool registration/calling, real tool-return-value influence on the final output, customer-scoped tool data via `ctx.deps`, invalid-output rejection, no raw-data leakage, and the bounded tool-calling loop). If you instead see `ModuleNotFoundError: No module named 'temporalio'`, you're running `pytest` with a different Python than the one in `.venv` — check that `which python3` and `which pytest` both point inside `.venv/bin` (a common cause is running `pytest` via a system or IDE-default Python instead of the activated venv).
+   Expected: `15 passed` across three files:
+   - `tests/test_fraud_hold_workflow.py` (5) — Workflow-level orchestration against the *real* `FraudHoldWorkflow`, with a test Agent substituted in via `monkeypatch` + `UnsandboxedWorkflowRunner`.
+   - `tests/test_generate_explanation_agent.py` (7) — Agent-level, called outside a Workflow (where `TemporalDurability` is transparent): tool registration/calling, real tool-return-value influence, customer-scoped tool data via `ctx.deps`, invalid-output rejection, no raw-data leakage, the bounded tool-calling loop.
+   - `tests/test_generate_explanation_agent_durability.py` (3) — the fine-grained durability boundary itself: a completed tool Activity is proven *not* re-executed when a later model step fails and retries (verified via both an invocation counter and Temporal's own Event History), the usage-limits bound through the real Activity boundary, and a `Replayer`-based replay-determinism check.
+
+   If you instead see `ModuleNotFoundError: No module named 'temporalio'`, you're running `pytest` with a different Python than the one in `.venv` — check that `which python3` and `which pytest` both point inside `.venv/bin` (a common cause is running `pytest` via a system or IDE-default Python instead of the activated venv).
 
 5. Copy the example environment file:
 
@@ -284,6 +343,14 @@ This brings up:
 
 Ollama is expected to run on your **host machine**, not inside Docker — the worker container talks to it via `http://host.docker.internal:11434/v1` (already wired into `docker-compose.yml`). This avoids bundling model weights into the container and lets you swap models without rebuilding.
 
+To run **two** Worker replicas polling the same task queue (needed for [Demo C](#demo-c--worker-pod-failover-during-durable-agent-execution)):
+
+```bash
+docker compose up --build --scale worker=2
+```
+
+No changes to `docker-compose.yml` are needed for this — the `worker` service has no `container_name` and no fixed host port, which are the two things that would otherwise block scaling it. Each replica gets its own container hostname, which is what makes it possible to tell them apart in logs and in the Temporal Web UI's Event History (see `app/worker.py`'s `identity=`).
+
 ### Option B: Run it all natively
 
 ```bash
@@ -326,7 +393,7 @@ OLLAMA_BASE_URL=http://localhost:11434/v1
 OLLAMA_MODEL=qwen3.5:latest
 ```
 
-The `generate_explanation` activity uses PydanticAI's OpenAI-compatible provider pointed at Ollama's local endpoint — no external API key, no data leaving your machine.
+The PydanticAI Agent in `generate_explanation.py` uses PydanticAI's OpenAI-compatible provider pointed at Ollama's local endpoint — no external API key, no data leaving your machine.
 
 ---
 
@@ -412,7 +479,19 @@ HTTP/1.1 404 Not Found
 {"detail":"No transaction found for 'TXN-DOES-NOT-EXIST'"}
 ```
 
-## The crash-resume demo
+## Three durability demonstrations
+
+These prove three distinct, related properties. Don't conflate them:
+
+| | Proves | How |
+|---|---|---|
+| **Demo A** | The *business Workflow* survives a Worker crash while durably waiting for a customer. | Manual, below. |
+| **Demo B** | Model/tool steps *inside* one Agent investigation are individually durable — a completed one isn't redone just because a later one fails. | Automated test (deterministic, reproducible on every run) + a manual Event-History inspection. |
+| **Demo C** | An in-flight Agent Activity survives a *different* Worker container being terminated mid-execution — not just a restart — and retries on a surviving replica; work already completed before the interruption is preserved. | Manual, using two Docker Worker replicas. |
+
+Taken together: Temporal keeps the business Workflow durable across Worker failure and gives PydanticAI model/tool calls durable Activity boundaries. Completed Activities are preserved in history, while incomplete Activities can retry on another Worker.
+
+### Demo A — Business Workflow durability
 
 1. Start the worker and fire the `hold` request above.
 2. Confirm in the Temporal Web UI (`http://localhost:8233`) that the workflow is now sitting in **"waiting for signal."** Open its **Event History** tab while you're there — see [How this shows up in Temporal's Event History](#how-this-shows-up-in-temporals-event-history) above for how to read it.
@@ -421,6 +500,56 @@ HTTP/1.1 404 Not Found
 5. Send the `respond` request from above.
 
 The workflow resumes from exactly where it paused and resolves the case correctly — no lost progress — even though the process that was running it died in the middle. (Temporal guarantees the workflow's durable progress and correct replay; it does not give activities exactly-once execution — they're at-least-once, so a real, non-mocked hold/release/block integration would need to be idempotent on its own, e.g. keyed by `transaction_id`.)
+
+### Demo B — Fine-grained Agent durability
+
+The authoritative, reproducible proof of this property is the automated test `tests/test_generate_explanation_agent_durability.py::test_completed_tool_activity_is_not_reexecuted_on_later_failure` — it deterministically scripts a tool call succeeding, then the *next* model turn failing once and retrying, and verifies (via both a Python invocation counter and Temporal's own Event History `ActivityTaskScheduled` counts) that the tool was invoked exactly once despite the retry:
+
+```bash
+pytest tests/test_generate_explanation_agent_durability.py -v
+```
+
+To see the underlying mechanism live against a real hold: fire the `hold` curl example above, then open the workflow's **Event History** in the Web UI (`http://localhost:8233`). Instead of one `generate_explanation` Activity, you'll see the investigation broken into several separate Activity Task entries — `agent__fraud_hold_investigator__model_request` (once per model turn) and `agent__fraud_hold_investigator__toolset__<agent>__call_tool` (once per tool call actually made) — each independently scheduled, started, and completed. That's what makes the automated test's property possible: each of those is its own durability checkpoint, recorded by the Temporal server the moment it completes, regardless of what happens afterward.
+
+### Demo C — Worker-pod failover during durable Agent execution
+
+Proves cross-Worker failover for an in-flight Agent Activity: when the Worker container executing it is terminated mid-execution — not just restarted (Demo A) — a *different*, surviving Worker container picks up the retry, using two Worker replicas polling the same task queue. Everything that completed *before* the interruption (here, the first model turn and the first tool call) is preserved from Event History rather than redone. This is related to, but distinct from, Demo B's specific claim: Demo B automatedly proves a completed *tool* Activity survives a *later model* Activity failing and retrying, all on one Worker; Demo C proves an in-flight Activity itself can resume on *another* Worker after the original one is killed. Don't read Demo C as re-proving Demo B's exact scenario — it demonstrates the cross-Worker failover property specifically.
+
+**Setup:**
+
+```bash
+docker compose up --build --scale worker=2
+docker compose logs -f worker   # watch both replicas' output, prefixed by container name
+```
+
+Each replica logs its own container hostname on startup (`Worker started (worker-<hostname>), polling task queue...`) and on every mocked-activity print line (`[hold:<hostname>] ...`, etc.) — that's how you'll tell them apart.
+
+**Make the interruption window reproducible**, rather than racing a live Ollama call's variable timing: set `DEMO_FAILOVER_DELAY_SECONDS` (e.g. to `20`) in `.env` before bringing the stack up, or export it before `docker compose up`. This adds a plain `asyncio.sleep(...)` inside the `lookup_customer_channel_preference` tool — the *second* of the Agent's two read-only tools, which the Agent typically calls in the same turn as the first — giving you a wide, predictable window to identify and kill a Worker while a real Activity is genuinely in-flight. It's `0` (off) by default everywhere else, including every automated test, and it only ever delays this one already-read-only, already-idempotent Activity — it doesn't touch Workflow code, `customer_id` handling, or bypass `TemporalDurability` in any way.
+
+> **Honest note on scope:** the interrupted/retried Activity in this reproducible demo is the second **tool** call, not the second **model** request. Delaying a specific model-request Activity would require patching PydanticAI's internal activity functions — private API, which this project deliberately avoids (see `AGENTS.md`). Delaying our own tool achieves the same underlying property with only public, documented mechanisms: an in-flight Activity survives a Worker death, and whatever completed *before* it (here, the first model turn and the first tool call) is preserved and not re-executed.
+
+**Sequence:**
+
+1. Fire the `hold` curl example (above) with a fraud score at/above the threshold.
+2. Watch the Web UI's Event History: confirm `agent__fraud_hold_investigator__model_request` (turn 1) and `agent__fraud_hold_investigator__toolset__<agent>__call_tool` for `lookup_recent_transactions` have both completed, and a `call_tool` Activity for `lookup_customer_channel_preference` is now running (its `ActivityTaskStarted` event's `Identity` field names one of your two Worker containers — that's "Worker A").
+3. Kill Worker A specifically: `docker compose stop <the container name shown in Identity/logs>` (find it with `docker compose ps`).
+4. Watch the logs: Worker B (the surviving replica) picks up the retry. The delayed tool call succeeds on Worker B; the Agent continues to its final model turn, which also runs on whichever Worker is free (commonly B).
+5. The investigation completes normally: `InvestigationSummary` produced, customer notified, workflow durably waiting again.
+6. Send the `respond` curl example — the workflow resolves (`release`/`block`) exactly as in Demo A.
+
+**Evidence to capture in the Event History:**
+
+- The first `model_request` Activity: scheduled, started, completed (once).
+- The `lookup_recent_transactions` `call_tool` Activity: scheduled, started, completed (once) — before the interruption.
+- The `lookup_customer_channel_preference` `call_tool` Activity: `ActivityTaskStarted` shows attempt 1 on Worker A's identity, then (after Worker A is killed) a further `ActivityTaskStarted` shows attempt 2 (or a fresh schedule, depending on how far attempt 1 got) on Worker B's identity — but **only one** `ActivityTaskScheduled` for this Activity, confirming it's a retry of the same logical step, not a duplicate.
+- The final `model_request` Activity: scheduled and completed only after the tool call above finishes.
+- `notify_customer`, the Signal, and the final `WorkflowExecutionCompleted` all proceed normally afterward.
+
+Distinguish `ActivityTaskScheduled` (a new logical step) from a second `ActivityTaskStarted` under the *same* schedule (a retry of that same step) — conflating them would make it look like more work happened than actually did.
+
+**What this does and doesn't prove:** Worker B reconstructs the Workflow/Agent orchestration from Temporal's Event History — completed model/tool Activity results are reused from that history, while the interrupted Activity is retried. This is **not** Python process memory moving from Worker A to Worker B, and it is **not** recovery of any hidden or token-level model reasoning state — the durable recovery boundary is exactly the recorded Activity result, nothing more granular than that.
+
+**Unset `DEMO_FAILOVER_DELAY_SECONDS`** (or set it back to `0`) before using this stack for anything other than this specific demo.
 
 ### Stopping everything
 
@@ -431,7 +560,7 @@ The workflow resumes from exactly where it paused and resolves the case correctl
 
 ## Troubleshooting
 
-**Ollama isn't running, or the wrong model is configured.** `generate_explanation` will retry 3 times against `OLLAMA_BASE_URL`/`OLLAMA_MODEL` (from `.env`) and then fall back to a fixed explanation rather than failing the workflow — see the Architecture diagram above. Each attempt may itself involve several model/tool round trips (the Agent deciding whether to call its read-only tools), bounded by the `usage_limits` in `generate_explanation.py` so a single attempt can't run away — but a full attempt is still one Activity attempt, and Temporal still retries the whole thing, tool calls included, on failure. So a broken Ollama setup won't crash a held transaction, but it will mean every hold gets the generic fallback message instead of a real explanation. Confirm with `ollama list` and `curl http://localhost:11434/api/tags` (see [Setup and Verification](#setup-and-verification)); double-check `OLLAMA_MODEL` in `.env` matches a model you've actually pulled.
+**Ollama isn't running, or the wrong model is configured.** Every model-request Activity retries up to 2 attempts against `OLLAMA_BASE_URL`/`OLLAMA_MODEL` (from `.env`), and each tool-call Activity likewise — see [Timeout and retry budget](#timeout-and-retry-budget) above. If the Agent still can't complete after that (e.g. Ollama is unreachable for the whole investigation), the Workflow catches the resulting failure and falls back to a fixed explanation rather than failing — see the Architecture diagram above. So a broken Ollama setup won't crash a held transaction, but it will mean every hold gets the generic fallback message instead of a real explanation, and you'll see failed `agent__fraud_hold_investigator__model_request` Activity attempts in the Event History. Confirm with `ollama list` and `curl http://localhost:11434/api/tags` (see [Setup and Verification](#setup-and-verification)); double-check `OLLAMA_MODEL` in `.env` matches a model you've actually pulled.
 
 **Port already in use (`8000`, `7233`, or `8233`).** These are used by the API, the Temporal frontend service, and the Temporal Web UI respectively. Find whatever's already bound to the port (e.g. `lsof -i :8000` on Mac/Linux) and stop it, or change the mapping in `docker-compose.yml`'s `ports:` (Docker) — for native mode, `uvicorn app.main:app --port <other-port>` and `temporal server start-dev --ui-port <other-port>` accept alternate ports directly.
 

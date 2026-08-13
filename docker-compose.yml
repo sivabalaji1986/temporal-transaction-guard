@@ -48,8 +48,16 @@ services:
       - OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
       - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3.5:latest}
       - FRAUD_SCORE_THRESHOLD=${FRAUD_SCORE_THRESHOLD:-70}
+      # Demo-only, 0/off unless explicitly set -- see README's "Demo C"
+      # (Worker-pod failover) and app/activities/generate_explanation.py.
+      - DEMO_FAILOVER_DELAY_SECONDS=${DEMO_FAILOVER_DELAY_SECONDS:-0}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
       temporal:
         condition: service_healthy
+    # No container_name and no fixed host ports on this service -- both
+    # would block `docker compose up --scale worker=2` (used by "Demo C").
+    # Compose auto-names replicas (e.g. ..._worker-1, ..._worker-2) and each
+    # gets its own container hostname, which is what makes per-replica
+    # identity in logs/Event History work (see app/worker.py).

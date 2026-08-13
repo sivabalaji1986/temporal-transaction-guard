@@ -3,11 +3,15 @@ fastapi==0.141.1
 uvicorn==0.52.1
 pydantic==2.13.4
 pydantic-settings==2.14.2
-# MUST stay pydantic-ai-slim[openai], NOT the full pydantic-ai package: the
-# full package bundles the unused `mcp` extra -> fastmcp-slim -> a global
-# beartype.claw import hook that poisons Temporal's sandboxed workflow
-# importer, causing a permanent crash after any worker restart. See commit
-# 0e84137 for the full diagnosis (it took three attempts to find this).
-pydantic-ai-slim[openai]==2.22.0
+# MUST stay pydantic-ai-slim[openai,temporal], NOT the full pydantic-ai
+# package: the full package bundles the unused `mcp` extra -> fastmcp-slim ->
+# a global beartype.claw import hook that poisons Temporal's sandboxed
+# workflow importer, causing a permanent crash after any worker restart. See
+# commit 0e84137 for the full diagnosis (it took three attempts to find
+# this). The `temporal` extra pulls in temporalio's own Temporal durability
+# integration (pydantic_ai.durable_exec.temporal) -- same 2.22.0 version
+# already pinned below, no version change; verified it requires
+# temporalio>=1.24.0, already satisfied by the temporalio pin above.
+pydantic-ai-slim[openai,temporal]==2.22.0
 pytest==9.1.1
 pytest-asyncio==1.4.0

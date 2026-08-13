@@ -1,10 +1,15 @@
 # tests/test_generate_explanation_agent.py
 """Tests for the tool-using PydanticAI Agent inside generate_explanation.py.
 
-These call `generate_explanation(...)` directly (not through a Temporal
-Workflow/Worker) and swap out the real Ollama model for one of PydanticAI's
-deterministic test models via `_agent.override(model=...)`. No real Ollama,
-Temporal server, or Docker is required or contacted.
+These call `_agent.run(...)` directly (not through a Temporal Workflow/
+Worker) and swap out the real Ollama model for one of PydanticAI's
+deterministic test models via `_agent.override(model=...)`. `TemporalDurability`
+is transparent outside of a Workflow (confirmed against the installed
+pydantic-ai-slim==2.22.0 wheel), so these calls exercise the Agent's own
+logic -- tool registration, structured output, usage limits -- as plain
+in-process calls, without needing a Temporal server/Worker or touching
+Ollama. (`tests/test_generate_explanation_agent_durability.py` covers the
+Temporal-Activity fan-out itself.)
 
 Two different test models are used deliberately, because they prove
 different things:
@@ -32,10 +37,27 @@ from pydantic_ai.models.test import TestModel
 from app.activities.generate_explanation import (
     _AGENT_USAGE_LIMITS,
     _agent,
-    generate_explanation,
     lookup_customer_channel_preference,
     lookup_recent_transactions,
 )
+from app.models import InvestigationSummary
+
+
+async def _run_agent(
+    fraud_score: float, trigger_reason: str, customer_id: str
+) -> InvestigationSummary:
+    """Same prompt construction fraud_hold_workflow.py uses when calling
+    `_agent.run(...)` -- kept in one place so every test in this file
+    exercises the exact same call shape production does.
+    """
+    result = await _agent.run(
+        f"fraud_score={fraud_score}, trigger_reason={trigger_reason}. "
+        "Gather any useful context via your tools, then write the "
+        "customer_explanation, ops_summary, and notification_type.",
+        deps=customer_id,
+        usage_limits=_AGENT_USAGE_LIMITS,
+    )
+    return result.output
 
 
 def _tool_result(messages: list[ModelMessage], tool_name: str) -> Any:
@@ -55,10 +77,10 @@ async def test_agent_can_invoke_both_read_only_tools():
     # the Agent's output still satisfies the InvestigationSummary schema
     # once tools are in the loop.
     with _agent.override(model=TestModel()):
-        result = await generate_explanation(85, "UNUSUAL_LOCATION", "CUST-101")
-    assert result.notification_type in {"sms", "email", "push"}
-    assert isinstance(result.customer_explanation, str)
-    assert isinstance(result.ops_summary, str)
+        output = await _run_agent(85, "UNUSUAL_LOCATION", "CUST-101")
+    assert output.notification_type in {"sms", "email", "push"}
+    assert isinstance(output.customer_explanation, str)
+    assert isinstance(output.ops_summary, str)
 
 
 @pytest.mark.asyncio
@@ -90,10 +112,10 @@ async def test_real_tool_return_value_influences_final_output():
         )
 
     with _agent.override(model=FunctionModel(scripted_model)):
-        result = await generate_explanation(85, "UNUSUAL_LOCATION", "CUST-101")
+        output = await _run_agent(85, "UNUSUAL_LOCATION", "CUST-101")
 
     # lookup_customer_channel_preference's real (mocked) return value.
-    assert result.notification_type == "email"
+    assert output.notification_type == "email"
 
 
 @pytest.mark.asyncio
@@ -105,8 +127,8 @@ async def test_tool_results_are_scoped_by_customer_id_via_deps_only():
     # 2. The model has no way to ask about a *different* customer: the
     #    tool's schema (what the model actually sees) has no customer_id
     #    parameter at all. The only customer_id a tool call can ever see is
-    #    whichever one this Activity was called with, via
-    #    `_agent.run(..., deps=customer_id)`.
+    #    whichever one this run was called with, via `_agent.run(...,
+    #    deps=customer_id)`.
     def scripted_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         real_channel = _tool_result(messages, "lookup_customer_channel_preference")
         if real_channel is not None:
@@ -128,14 +150,14 @@ async def test_tool_results_are_scoped_by_customer_id_via_deps_only():
         )
 
     with _agent.override(model=FunctionModel(scripted_model)):
-        result_101 = await generate_explanation(85, "UNUSUAL_LOCATION", "CUST-101")
-        result_202 = await generate_explanation(85, "UNUSUAL_LOCATION", "CUST-202")
+        output_101 = await _run_agent(85, "UNUSUAL_LOCATION", "CUST-101")
+        output_202 = await _run_agent(85, "UNUSUAL_LOCATION", "CUST-202")
 
     # Two different customer_id values -> two genuinely different scoped
     # results (CUST-101 -> "email", CUST-202 -> "push" in the mock data).
-    assert result_101.notification_type == "email"
-    assert result_202.notification_type == "push"
-    assert result_101.notification_type != result_202.notification_type
+    assert output_101.notification_type == "email"
+    assert output_202.notification_type == "push"
+    assert output_101.notification_type != output_202.notification_type
 
     # The tool's schema has no customer_id parameter -- confirms the model
     # itself never sees or supplies it, so it can't choose whose data to
@@ -168,7 +190,7 @@ async def test_invalid_notification_type_is_rejected_not_silently_accepted():
 
     with _agent.override(model=FunctionModel(bad_model)):
         with pytest.raises(UnexpectedModelBehavior):
-            await generate_explanation(85, "UNUSUAL_LOCATION", "CUST-101")
+            await _run_agent(85, "UNUSUAL_LOCATION", "CUST-101")
 
 
 @pytest.mark.asyncio
@@ -215,10 +237,10 @@ async def test_customer_explanation_does_not_leak_raw_tool_data():
         )
 
     with _agent.override(model=FunctionModel(scripted_model)):
-        result = await generate_explanation(85, "UNUSUAL_LOCATION", "CUST-101")
+        output = await _run_agent(85, "UNUSUAL_LOCATION", "CUST-101")
 
-    assert raw_marker not in result.customer_explanation
-    assert raw_marker in result.ops_summary
+    assert raw_marker not in output.customer_explanation
+    assert raw_marker in output.ops_summary
 
 
 @pytest.mark.asyncio
@@ -234,7 +256,7 @@ async def test_agent_loop_is_bounded():
 
     with _agent.override(model=FunctionModel(infinite_loop_model)):
         with pytest.raises(UsageLimitExceeded):
-            await generate_explanation(85, "UNUSUAL_LOCATION", "CUST-101")
+            await _run_agent(85, "UNUSUAL_LOCATION", "CUST-101")
 
     # Documents the actual configured bound so this test breaks loudly if
     # someone loosens it without updating this test/the docs together.

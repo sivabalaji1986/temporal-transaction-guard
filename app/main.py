@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from pydantic_ai.durable_exec.temporal import PydanticAIPlugin
 from temporalio.client import Client
 from temporalio.common import WorkflowIDReusePolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -18,7 +19,9 @@ _client: Client | None = None
 async def lifespan(app: FastAPI):
     global _client
     _client = await Client.connect(
-        settings.temporal_address, data_converter=pydantic_data_converter
+        settings.temporal_address,
+        data_converter=pydantic_data_converter,
+        plugins=[PydanticAIPlugin()],
     )
     yield
 
