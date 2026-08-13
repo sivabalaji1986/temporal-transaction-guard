@@ -321,6 +321,8 @@ Get the repo ready to work with, and confirm it's in a working state, before run
 
 ## Running locally
 
+Note: if you have local Temporal dev-server state from before this migration, wipe it first — see [Why this exists](#why-this-exists) for why.
+
 ### Prerequisites
 
 - Python 3.11+
