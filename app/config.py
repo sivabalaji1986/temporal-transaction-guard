@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     # only for the manual Worker-pod-failover demo (README, "Demo C") -- see
     # the usage note in app/activities/generate_explanation.py.
     demo_failover_delay_seconds: float = 0
+    demo_model_retry_interval_seconds: int = 1
 
 
 settings = Settings()

@@ -33,7 +33,8 @@ _AGENT_USAGE_LIMITS = UsageLimits(request_limit=6, tool_calls_limit=4)
 # Agent phase's wall-clock budget would be unbounded.
 #
 # Worst-case Agent-phase budget (maximum path permitted by the UsageLimits
-# above, assuming every single invocation fails once and retries):
+# above, assuming every single invocation fails once and retries, and
+# demo_model_retry_interval_seconds is left at its default of 1 -- see below):
 #   model:  6 x (60s + 1s backoff + 60s) = 6 x 121s = 726s
 #   tools:  4 x (10s + 1s backoff + 10s) = 4 x  21s =  84s
 #   total:  810s <= 900s (the required Agent-phase ceiling)
@@ -47,7 +48,10 @@ _BASE_ACTIVITY_CONFIG: ActivityConfig = {
 }
 _MODEL_ACTIVITY_CONFIG: ActivityConfig = {
     "start_to_close_timeout": timedelta(seconds=60),
-    "retry_policy": RetryPolicy(maximum_attempts=2, initial_interval=timedelta(seconds=1)),
+    "retry_policy": RetryPolicy(
+        maximum_attempts=2,
+        initial_interval=timedelta(seconds=settings.demo_model_retry_interval_seconds),
+    ),
 }
 
 _agent = Agent(

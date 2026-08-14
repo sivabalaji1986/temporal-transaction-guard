@@ -50,7 +50,18 @@ activity logic. For a general walkthrough, see `README.md` and
    `generate_explanation.py`), for a worst case of 810s, kept under the
    workflow-level 900s ceiling. If you add more tools, raise the round-trip
    count, or change a model's typical latency, recompute this worst case
-   deliberately — don't just delete or silently widen the limits.
+   deliberately — don't just delete or silently widen the limits. The
+   model-request retry backoff (the `1s` in that calculation) is
+   configurable via `settings.demo_model_retry_interval_seconds`
+   (`DEMO_MODEL_RETRY_INTERVAL_SECONDS`), default `1` — a demo/observability
+   knob like `DEMO_FAILOVER_DELAY_SECONDS`, not something to widen for
+   routine tuning. Raising it also raises the 810s worst case and must be
+   recomputed the same way. Because `Settings` reads `.env` from the current
+   working directory regardless of context, leaving either `DEMO_*` variable
+   set in your local `.env` after a demo silently slows down (or, for
+   `DEMO_FAILOVER_DELAY_SECONDS`, can badly inflate) a native `pytest tests/`
+   run too, not just the Docker/native "stack" — reset both to `0`/`1` when
+   you're done with a demo.
 
 7. **The Agent's stable name is a durability contract, not cosmetic.**
    `Agent(..., name="fraud_hold_investigator")` in `generate_explanation.py`

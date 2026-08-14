@@ -124,6 +124,8 @@ The 60s model-request timeout isn't a guess: real local measurement (this repo's
 
 If you change `UsageLimits` or either activity config, recalculate this budget — don't just widen a number without checking the total.
 
+The `1s backoff` in the model-request calculation above is configurable via `DEMO_MODEL_RETRY_INTERVAL_SECONDS` (default `1`, matching the math above) — a demo/observability knob, like `DEMO_FAILOVER_DELAY_SECONDS` below, not something to widen for routine use. Raising it raises the 810s total and requires recalculating the same way. Because `Settings` reads `.env` from the current working directory, leaving either `DEMO_*` variable set locally after a demo also affects a native `pytest tests/` run, not just the running app — reset both to `0`/`1` when you're done.
+
 If you have stale local Temporal dev-server state, wipe it (`docker compose down -v`, or don't reuse an old `temporal server start-dev` data directory) before running this project — this is a small demo repo, so a clean-slate restart is the deliberate approach rather than a production-grade versioning strategy.
 
 ### How this shows up in Temporal's Event History
