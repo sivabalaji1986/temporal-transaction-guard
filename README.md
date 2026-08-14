@@ -4,7 +4,7 @@ A durable **hold → investigate → notify → wait → resolve** workflow for 
 
 > **Agentic investigation, deterministic action.** The AI Agent may autonomously gather additional read-only context before writing its explanation, but it never decides whether to hold, release, block, or escalate a transaction — that stays entirely in the Temporal Workflow.
 
-> **Fine-grained durability.** The Agent's `agent.run(...)` call executes directly inside the Workflow. Each individual model request and each individual tool call becomes its own Temporal Activity, separately recorded in Event History — not one opaque Activity containing the whole investigation. A Worker failure partway through an investigation does not force the whole thing to restart: whatever model/tool steps already completed are preserved and are not re-executed on resume, only the interrupted step retries. See [Before / after this migration](#before--after-this-migration) below.
+> **Fine-grained durability.** The Agent's `agent.run(...)` call executes directly inside the Workflow. Each individual model request and each individual tool call becomes its own Temporal Activity, separately recorded in Event History — not one opaque Activity containing the whole investigation. A Worker failure partway through an investigation does not force the whole thing to restart: whatever model/tool steps already completed are preserved and are not re-executed on resume, only the interrupted step retries.
 
 > **What this project is *not*:** a fraud-detection engine. An upstream fraud engine doesn't send us every transaction — it identifies candidate transactions that may require further action and hands each one to us with a `fraudScore`, `triggerReason`, and `customerId`. We don't recompute or second-guess that score; we apply a simple deterministic hold policy on top of it (hold if the score is at/above a configured threshold, otherwise don't) and handle what happens *after* that decision: placing a hold, explaining it to the customer, waiting durably for a response, and resolving the case — correctly, even if a server crashes in the middle.
 
@@ -101,6 +101,7 @@ Record no-hold outcome              Place temporary hold (Activity)
 - **Everything that touches the outside world is an Activity:** every LLM request, every tool call, placing a hold, sending a notification, releasing/blocking funds, logging the no-hold outcome. Activities are the only things that can fail, retry, and have side effects. `agent.run(...)` itself executes as Workflow code, but every piece of actual I/O it does is wrapped in its own Activity by `TemporalDurability` — the Workflow code stays deterministic.
 - **Agentic investigation, deterministic action.** The PydanticAI Agent (`app/activities/generate_explanation.py`) may call two read-only tools — `lookup_recent_transactions` and `lookup_customer_channel_preference` — to gather extra context about the customer before writing its response. It decides for itself whether, and in what order, to call them. What it can **never** do is decide whether to hold, release, block, or escalate, recompute the fraud score, or call a write-side/banking tool — those stay entirely in the Workflow and its other Activities. This keeps the demo focused on durable orchestration around a genuinely agentic AI component, without letting the AI touch anything that actually moves money.
 - **The Agent has a stable, explicit name (`fraud_hold_investigator`), and its built-in tool registry has a stable, framework-fixed ID (`<agent>`).** Both become part of the Temporal Activity names in-flight Workflow histories depend on (e.g. `agent__fraud_hold_investigator__model_request`) — treat them as durable contracts, not casually renameable. See `AGENTS.md`.
+- **This project does not use `TemporalAgent`, an older PydanticAI wrapper for durable execution — it uses the current `capabilities=[TemporalDurability(...)]` pattern on a regular `Agent` instead.** See `AGENTS.md`.
 - **The Agent's tools stay read-only.** Because each model request and each tool call is now its own Temporal Activity, a retry only re-runs the *one* step that failed — not the whole investigation. That's still only safe because the tools are read-only and naturally idempotent (looking up the same customer's data twice has no side effect); a future tool with a real side effect would need careful thought, not just "add another `@_agent.tool`."
 - **The Agent's tool-calling loop is explicitly bounded**, not left to run indefinitely. `generate_explanation.py` passes `usage_limits=UsageLimits(request_limit=6, tool_calls_limit=4)` to the Agent run — roughly double the normal path's expected 3 requests / 2 tool calls, but still far short of unbounded. Each individual model/tool Activity also has an explicit, bounded `start_to_close_timeout` and `retry_policy` (Temporal's own default retry policy is *unlimited* attempts, so this has to be set explicitly) — see [Timeout and retry budget](#timeout-and-retry-budget) below for the full worst-case calculation. Exceeding the usage-limits bound is just another Agent failure, handled by the same deterministic fallback described below.
 - **Customer-facing text must summarize, not leak, internal context.** The Agent's system prompt explicitly instructs it to turn whatever it gathers (recent transactions, channel preference, the raw trigger reason) into a plain-language `customer_explanation` — never to paste raw tool output or internal identifiers into it. `ops_summary` is the place for more internal detail.
@@ -119,27 +120,11 @@ Every model-request and tool-call Activity has an explicit `start_to_close_timeo
 - Tools: 4 × (10s + 1s backoff + 10s) = 84s
 - **Total: 810s**, comfortably under a 900s (15 minute) ceiling.
 
-The 60s model-request timeout isn't a guess: real local measurement (this repo's configured default, `qwen3.5:latest`, forced to a genuine cold start, with the actual system prompt and tool schemas) showed a worst observed latency of **17.1 seconds** across multiple trials — 60s gives roughly 3.5x headroom over that. Two attempts per step, not three, is a deliberate tradeoff: the fine-grained design's *aggregate* retry opportunity across a full investigation is actually higher than before it became fine-grained (up to 6 × 2 = 12 possible model-request attempts across a run, versus 3 attempts total for the old single opaque Activity), even though any one step gets fewer attempts than before.
+The 60s model-request timeout isn't a guess: real local measurement (this repo's configured default, `qwen3.5:latest`, forced to a genuine cold start, with the actual system prompt and tool schemas) showed a worst observed latency of **17.1 seconds** across multiple trials — 60s gives roughly 3.5x headroom over that. Two attempts per individual step is a deliberate tradeoff that still adds up to substantial aggregate retry coverage across a full investigation: up to 6 × 2 = 12 possible model-request attempts and 4 × 2 = 8 possible tool-call attempts across a single run, even though any one step only gets two attempts of its own.
 
 If you change `UsageLimits` or either activity config, recalculate this budget — don't just widen a number without checking the total.
 
-### Before / after this migration
-
-```text
-Before:
-  generate_explanation = one Activity
-  failure midway -> entire Agent loop retries
-
-After:
-  agent.run() executes in the Workflow
-  model/tool I/O = separate Temporal Activities
-  completed Activity results remain in Event History
-  replay continues using those durable results
-```
-
-This project originally ran the whole investigation as one hand-written `@activity.defn async def generate_explanation(...)` function that called `_agent.run(...)` internally — a coarse boundary where any failure meant Temporal retried the *entire* loop, tool calls included. It now uses PydanticAI's `TemporalDurability` capability plus `PydanticAIWorkflow`/`PydanticAIPlugin`, so `agent.run(...)` executes directly as Workflow code and each model request and tool call becomes its own Activity automatically. `TemporalAgent` (an older, now-deprecated PydanticAI wrapper) is deliberately not used — see `AGENTS.md`.
-
-If you're picking this repo up mid-history: local Temporal dev-server state from before this migration doesn't replay against the new Workflow shape. Wipe it (`docker compose down -v`, or just don't reuse an old `temporal server start-dev`'s data directory) before running the migrated code — this is a small learning/demo repo, so a clean-slate restart is the deliberate choice here rather than a production-grade versioning strategy.
+If you have stale local Temporal dev-server state, wipe it (`docker compose down -v`, or don't reuse an old `temporal server start-dev` data directory) before running this project — this is a small demo repo, so a clean-slate restart is the deliberate approach rather than a production-grade versioning strategy.
 
 ### How this shows up in Temporal's Event History
 
@@ -177,7 +162,7 @@ WorkflowExecutionStarted
   WorkflowExecutionCompleted ("released")
 ```
 
-Since each "Workflow Task" and "Activity Task" line above is really 3 history events, a single resolved hold now typically ends up as ~45-55 total events (more than before this migration, since the investigation is no longer one opaque Activity — this is the visible cost of the finer-grained durability). That's normal, not a sign anything's wrong — every one of those events is a durability checkpoint permanently recorded by the Temporal *server*, independent of the worker process. That's exactly why killing and restarting the worker mid-hold (see [Demo A](#demo-a--business-workflow-durability) and [Demo C](#demo-c--worker-pod-failover-during-durable-agent-execution) below) doesn't lose any progress: a new worker just picks up where this history left off.
+Since each "Workflow Task" and "Activity Task" line above is really 3 history events, a single resolved hold typically ends up as ~45-55 total events, since the investigation fans out into several separately tracked Activities rather than a single one. That's normal, not a sign anything's wrong — every one of those events is a durability checkpoint permanently recorded by the Temporal *server*, independent of the worker process. That's exactly why killing and restarting the worker mid-hold (see [Demo A](#demo-a--business-workflow-durability) and [Demo C](#demo-c--worker-pod-failover-during-durable-agent-execution) below) doesn't lose any progress: a new worker just picks up where this history left off.
 
 ---
 
@@ -321,7 +306,7 @@ Get the repo ready to work with, and confirm it's in a working state, before run
 
 ## Running locally
 
-Note: if you have local Temporal dev-server state from before this migration, wipe it first — see [Why this exists](#why-this-exists) for why.
+Note: if you have stale local Temporal dev-server state, wipe it first — see [Timeout and retry budget](#timeout-and-retry-budget) for details.
 
 ### Prerequisites
 
