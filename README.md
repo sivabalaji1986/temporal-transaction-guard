@@ -135,7 +135,7 @@ If you have stale local Temporal dev-server state, wipe it (`docker compose down
 Open any workflow in the Temporal Web UI (`http://localhost:8233`) and click its **Event History** tab, and you'll see a repeating pattern rather than one line per activity. That's expected — here's how to read it:
 
 - **Workflow Task** — the worker waking up to run/replay `FraudHoldWorkflow.run` up to its next decision point, then going back to sleep. Every activity call (including each individual model/tool call the Agent makes), every signal, and the timer firing/being canceled each trigger one of these. Recorded as 3 events: `WorkflowTaskScheduled` → `WorkflowTaskStarted` → `WorkflowTaskCompleted`.
-- **Activity Task** — the actual execution of one activity. Most are familiar (`place_hold`, `notify_customer`, `release`/`block`/`escalate`), but the Agent investigation now fans out into several, individually named and individually tracked: `agent__fraud_hold_investigator__model_request` (once per model turn — typically twice: decide whether to call a tool, then produce the final structured output) and `agent__fraud_hold_investigator__toolset__<agent>__call_tool` (once per tool call the Agent actually makes, zero or more). Each is 3 events — `ActivityTaskScheduled` → `ActivityTaskStarted` → `ActivityTaskCompleted` — plus one extra `ActivityTaskStarted` per retry attempt if it fails and gets retried (check the `Attempt` field, and `Last Failure` on that event for why the previous attempt didn't succeed, and the `Identity` field for which Worker container handled it — see [Demo C](#demo-c--worker-pod-failover-during-durable-agent-execution)).
+- **Activity Task** — the actual execution of one activity. Most are familiar (`place_hold`, `notify_customer`, `release`/`block`/`escalate`), but the Agent investigation now fans out into several, individually named and individually tracked: `agent__fraud_hold_investigator__model_request` (once per model turn — typically twice: decide whether to call a tool, then produce the final structured output) and `agent__fraud_hold_investigator__toolset__<agent>__call_tool` (once per tool call the Agent actually makes, zero or more). Each is 3 events — `ActivityTaskScheduled` → `ActivityTaskStarted` → `ActivityTaskCompleted` — plus one extra `ActivityTaskStarted` per retry attempt if it fails and gets retried (check the `Attempt` field, and `Last Failure` on that event for why the previous attempt didn't succeed, and the `Identity` field for which Worker container handled it — see [Demo C](#demo-c--cross-worker-failover-during-durable-agent-execution)).
 - **Timer** — the durable 24h wait: `TimerStarted` when `wait_condition`'s timeout kicks in, then either `TimerCanceled` (a signal arrived first) or `TimerFired` (24h passed with no response).
 - **Signal** — `WorkflowExecutionSignaled` the moment `/respond` (or `send_signal.py`) delivers `customer_responded`.
 - **Completion** — `WorkflowExecutionCompleted`, the terminal event, carrying the final result string.
@@ -166,7 +166,7 @@ WorkflowExecutionStarted
   WorkflowExecutionCompleted ("released")
 ```
 
-Since each "Workflow Task" and "Activity Task" line above is really 3 history events, a single resolved hold typically ends up as ~45-55 total events, since the investigation fans out into several separately tracked Activities rather than a single one. That's normal, not a sign anything's wrong — every one of those events is a durability checkpoint permanently recorded by the Temporal *server*, independent of the worker process. That's exactly why killing and restarting the worker mid-hold (see [Demo A](#demo-a--business-workflow-durability) and [Demo C](#demo-c--worker-pod-failover-during-durable-agent-execution) below) doesn't lose any progress: a new worker just picks up where this history left off.
+Since each "Workflow Task" and "Activity Task" line above is really 3 history events, a single resolved hold typically ends up as ~45-55 total events, since the investigation fans out into several separately tracked Activities rather than a single one. That's normal, not a sign anything's wrong — every one of those events is a durability checkpoint permanently recorded by the Temporal *server*, independent of the worker process. That's exactly why killing and restarting the worker mid-hold (see [Demo A](#demo-a--business-workflow-durability) and [Demo C](#demo-c--cross-worker-failover-during-durable-agent-execution) below) doesn't lose any progress: a new worker just picks up where this history left off.
 
 ---
 
@@ -200,6 +200,14 @@ temporal-transaction-guard/
 │       └── tests.yml
 ├── docs/
 │   └── LEARNING_GUIDE.md                  # File-by-file walkthrough for readers new to Python/this codebase
+├── screenshots/
+│   ├── SuccessWorkflow.png                # Baseline: a full successful fraud-hold run
+│   ├── demoa_1.png                        # Demo A: Signal recorded while Worker is down
+│   ├── demoa_2.png                        # Demo A: resumed and completed after Worker returns
+│   ├── demob_1.png                        # Demo B: model-request retry in the Timeline view
+│   ├── demob_2.png                        # Demo B: Attempt 2 detail (failure + successful retry)
+│   ├── democ_1.png                        # Demo C: cross-Worker tool retry in the Timeline view
+│   └── democ_2.png                        # Demo C: Worker A -> Worker B handoff in the logs
 ├── app/
 │   ├── main.py
 │   ├── models.py
@@ -336,7 +344,7 @@ This brings up:
 
 Ollama is expected to run on your **host machine**, not inside Docker — the worker container talks to it via `http://host.docker.internal:11434/v1` (already wired into `docker-compose.yml`). This avoids bundling model weights into the container and lets you swap models without rebuilding.
 
-To run **two** Worker replicas polling the same task queue (needed for [Demo C](#demo-c--worker-pod-failover-during-durable-agent-execution)):
+To run **two** Worker replicas polling the same task queue (needed for [Demo C](#demo-c--cross-worker-failover-during-durable-agent-execution)):
 
 ```bash
 docker compose up --build --scale worker=2
@@ -423,6 +431,10 @@ Response:
 {"status":"signal_sent"}
 ```
 
+![Successful fraud-hold Workflow](screenshots/SuccessWorkflow.png)
+
+*Successful fraud-hold Workflow. The temporary hold is placed first; the PydanticAI Agent then executes through separate model-request and read-only tool Activities, followed by notification, durable waiting, customer response, and final resolution.*
+
 ### More examples
 
 A transaction below the fraud-score threshold (default `70`, see `FRAUD_SCORE_THRESHOLD` in `.env.example`) — the response shape is identical to a held transaction; the difference (no hold placed, no notification sent) only shows up in the worker's logs or the Temporal Web UI, not in this response:
@@ -486,13 +498,25 @@ Taken together: Temporal keeps the business Workflow durable across Worker failu
 
 ### Demo A — Business Workflow durability
 
-1. Start the worker and fire the `hold` request above.
-2. Confirm in the Temporal Web UI (`http://localhost:8233`) that the workflow is now sitting in **"waiting for signal."** Open its **Event History** tab while you're there — see [How this shows up in Temporal's Event History](#how-this-shows-up-in-temporals-event-history) above for how to read it.
-3. Kill the worker process (`Ctrl+C` or `docker compose stop worker`).
-4. Restart it.
-5. Send the `respond` request from above.
+1. Start Temporal, the API, the worker, and Ollama (see [Running locally](#running-locally)).
+2. Submit an above-threshold transaction (the `hold` curl example above).
+3. Let `place_hold`, the Agent investigation, and `notify_customer` complete.
+4. Confirm in the Temporal Web UI (`http://localhost:8233`) that the workflow is now durably waiting for the customer response — see [How this shows up in Temporal's Event History](#how-this-shows-up-in-temporals-event-history) above for how to read it.
+5. Stop the worker (`Ctrl+C` or `docker compose stop worker`) — and leave it down.
+6. While the worker is still down, send the customer response (the `respond` curl example above).
+7. In the Web UI, confirm Temporal accepted and recorded the Signal, and that the workflow's status is still **Running**, not failed. You'll typically see a **Workflow Task Timed Out** event with `Timeout Type: TIMEOUT_TYPE_SCHEDULE_TO_START` — this is a *Workflow Task* timeout (no worker was available to pick up the next decision), not a Workflow execution failure. Temporal can accept and durably record a Signal even with zero workers running; nothing about the workflow's recorded state is affected by there being no worker to act on it yet.
+8. Restart the worker.
+9. Watch the workflow resume: once a worker is available again, Temporal delivers the already-recorded history and Signal to it, the workflow replays/continues from exactly where it left off, cancels the wait timer, runs the resolution activity (`release`/`block`), and completes.
 
-The workflow resumes from exactly where it paused and resolves the case correctly — no lost progress — even though the process that was running it died in the middle. (Temporal guarantees the workflow's durable progress and correct replay; it does not give activities exactly-once execution — they're at-least-once, so a real, non-mocked hold/release/block integration would need to be idempotent on its own, e.g. keyed by `transaction_id`.)
+![Demo A - Workflow remains running while Worker is unavailable](screenshots/demoa_1.png)
+
+*Demo A — Worker unavailable, Workflow still durable. The customer Signal is recorded in Temporal while no Worker is available to execute the next Workflow Task. The UI shows a `SCHEDULE_TO_START` timeout, but the Workflow itself remains `Running`.*
+
+![Demo A - Workflow resumes and completes after Worker returns](screenshots/demoa_2.png)
+
+*Demo A — Recovery after the Worker returns. Event History retains the earlier timeout and then shows resumed Workflow execution, timer cancellation, the resolution Activity, and final `WorkflowExecutionCompleted`.*
+
+This is a stronger proof than merely restarting a worker while it's still polling: it shows Temporal accepting and durably recording a customer Signal with *no worker running at all*, and a worker picking that state back up later and completing the case correctly — no lost progress, even though nothing was running to react to the Signal when it arrived. (Temporal guarantees the workflow's durable progress and correct replay; it does not give activities exactly-once execution — they're at-least-once, so a real, non-mocked hold/release/block integration would need to be idempotent on its own, e.g. keyed by `transaction_id`.)
 
 ### Demo B — Fine-grained Agent durability
 
@@ -502,9 +526,46 @@ The authoritative, reproducible proof of this property is the automated test `te
 pytest tests/test_generate_explanation_agent_durability.py -v
 ```
 
-To see the underlying mechanism live against a real hold: fire the `hold` curl example above, then open the workflow's **Event History** in the Web UI (`http://localhost:8233`). Instead of one `generate_explanation` Activity, you'll see the investigation broken into several separate Activity Task entries — `agent__fraud_hold_investigator__model_request` (once per model turn) and `agent__fraud_hold_investigator__toolset__<agent>__call_tool` (once per tool call actually made) — each independently scheduled, started, and completed. That's what makes the automated test's property possible: each of those is its own durability checkpoint, recorded by the Temporal server the moment it completes, regardless of what happens afterward.
+To see the underlying mechanism live against a real hold: fire the `hold` curl example above, then open the workflow's **Event History** in the Web UI (`http://localhost:8233`). You'll see the investigation broken into several separate Activity Task entries — `agent__fraud_hold_investigator__model_request` (once per model turn) and `agent__fraud_hold_investigator__toolset__<agent>__call_tool` (once per tool call actually made) — each independently scheduled, started, and completed. That's what makes the automated test's property possible: each of those is its own durability checkpoint, recorded by the Temporal server the moment it completes, regardless of what happens afterward.
 
-### Demo C — Worker-pod failover during durable Agent execution
+**Live demo, catching a real retry:** the automated test above is deterministic and doesn't depend on real Ollama timing — it's the reproducible proof. This live version shows the same property against a genuine investigation, but it depends on a model-request Activity actually failing on its first attempt (e.g. a real Ollama connection hiccup), which doesn't happen on every run. `DEMO_MODEL_RETRY_INTERVAL_SECONDS` doesn't force that failure — it only widens the backoff *if* one occurs, so a retry stays visible in the Web UI for longer than the 1-second default gives you. Set it, temporarily, in `.env` before bringing the stack up (or export it before `docker compose up`):
+
+```env
+DEMO_MODEL_RETRY_INTERVAL_SECONDS=20
+```
+
+The normal default is `1`; `20` is only a temporary observability override for this demo. Confirm the Worker container actually received it (Docker only picks up a changed `.env` on a fresh `docker compose up`, not a container already running):
+
+```bash
+docker compose exec worker env | grep DEMO_MODEL
+docker compose exec worker python -c "from app.config import settings; print(settings.demo_model_retry_interval_seconds)"
+docker compose exec worker python -c "from app.activities.generate_explanation import _MODEL_ACTIVITY_CONFIG; print(_MODEL_ACTIVITY_CONFIG)"
+```
+
+Fire the `hold` curl example and watch the workflow's **Timeline** in the Web UI. A run where the second model-request Activity happens to fail once looks like this:
+
+```text
+Model request 1                     ✅
+lookup_recent_transactions          ✅
+lookup_customer_channel_preference  ✅
+later model request attempt 1       ❌
+        ↓ retry backoff
+later model request attempt 2       ✅
+```
+
+![Demo B - Fine-grained Agent retry in Timeline](screenshots/demob_1.png)
+
+*Demo B — Fine-grained Agent retry. The first model request and earlier read-only tool Activities complete once. A later model-request Activity retries, while the completed tool steps remain preserved.*
+
+![Demo B - Model Activity attempt 2 details](screenshots/demob_2.png)
+
+*Demo B — Retry of the same model-request Activity. Temporal shows `Attempt: 2` together with the previous model-call failure, followed by successful completion. The retry occurs at the failed model-request boundary rather than restarting the entire Agent investigation.*
+
+The property on display is the same one the automated test proves precisely: only the failed model-request Activity retries. `place_hold`, `lookup_recent_transactions`, and `lookup_customer_channel_preference` all stay completed exactly once — they are not re-executed just because a later step failed.
+
+**Reset `DEMO_MODEL_RETRY_INTERVAL_SECONDS` to `1`** before using this stack for anything other than this specific demo.
+
+### Demo C — Cross-Worker failover during durable Agent execution
 
 Proves cross-Worker failover for an in-flight Agent Activity: when the Worker container executing it is terminated mid-execution — not just restarted (Demo A) — a *different*, surviving Worker container picks up the retry, using two Worker replicas polling the same task queue. Everything that completed *before* the interruption (here, the first model turn and the first tool call) is preserved from Event History rather than redone. This is related to, but distinct from, Demo B's specific claim: Demo B automatedly proves a completed *tool* Activity survives a *later model* Activity failing and retrying, all on one Worker; Demo C proves an in-flight Activity itself can resume on *another* Worker after the original one is killed. Don't read Demo C as re-proving Demo B's exact scenario — it demonstrates the cross-Worker failover property specifically.
 
@@ -524,23 +585,33 @@ Each replica logs its own container hostname on startup (`Worker started (worker
 **Sequence:**
 
 1. Fire the `hold` curl example (above) with a fraud score at/above the threshold.
-2. Watch the Worker logs (`docker compose logs -f --timestamps worker`) or the Web UI's Event History: confirm `agent__fraud_hold_investigator__model_request` (turn 1) and `agent__fraud_hold_investigator__toolset__<agent>__call_tool` for `lookup_recent_transactions` have both completed, then wait for a `[tool:<hostname>] lookup_customer_channel_preference START attempt=1 customer=...` log line — its hostname is "Worker A" (the same hostname the Event History's `ActivityTaskStarted` `Identity` field would show for this attempt).
-3. Kill Worker A specifically: `docker compose stop <the container name shown in the log line/Identity field>` (find it with `docker compose ps`).
+2. Watch the Worker logs (`docker compose logs -f --timestamps worker`): confirm `agent__fraud_hold_investigator__model_request` (turn 1) and `agent__fraud_hold_investigator__toolset__<agent>__call_tool` for `lookup_recent_transactions` have both completed (you can cross-check this in the Web UI's Event History too), then wait for a `[tool:<hostname>] lookup_customer_channel_preference START attempt=1 customer=...` log line — its hostname is "Worker A."
+3. Kill Worker A specifically: `docker compose stop <the container name shown in the log line>` (find it with `docker compose ps`).
 4. Watch the logs: Worker B (the surviving replica) picks up the retry — a second `[tool:<hostname>] lookup_customer_channel_preference START attempt=2 customer=...` line appears, this time with Worker B's hostname, followed by its `COMPLETE` line. The Agent continues to its final model turn, which also runs on whichever Worker is free (commonly B).
 5. The investigation completes normally: `InvestigationSummary` produced, customer notified, workflow durably waiting again.
 6. Send the `respond` curl example — the workflow resolves (`release`/`block`) exactly as in Demo A.
 
-**Evidence to capture, in the Worker logs (`docker compose logs -f --timestamps worker`):**
+![Demo C - Cross-Worker retry in Temporal](screenshots/democ_1.png)
+
+*Demo C — Cross-Worker retry visible in Temporal. The delayed `lookup_customer_channel_preference` tool Activity reaches a second attempt and the Workflow continues normally.*
+
+![Demo C - Worker A to Worker B handoff in logs](screenshots/democ_2.png)
+
+*Demo C — Attempt 1 and attempt 2 executed by different Workers. `lookup_customer_channel_preference` starts with `attempt=1` on one Worker and never completes there; Temporal retries the same Activity on a different Worker, where `attempt=2` starts and completes successfully.*
+
+**Worker logs and Event History prove two different halves of this — don't conflate them.** Worker logs establish the Worker-A → Worker-B handoff: they're what actually names which container ran attempt 1 and which container ran attempt 2. Temporal Event History establishes that the same logical Activity retried after the prior attempt failed and that Workflow execution continued from durable history — it doesn't, on its own, hand you a labeled "Worker A" / "Worker B" pair the way the logs do.
+
+**Evidence to capture, in the Worker logs (`docker compose logs -f --timestamps worker`) — this is the direct proof of *which* container ran which attempt:**
 
 - `[tool:<Worker A's hostname>] lookup_customer_channel_preference START attempt=1 customer=...` — no matching `COMPLETE` line for that attempt, since Worker A was killed while it was in flight.
 - `[tool:<Worker B's hostname>] lookup_customer_channel_preference START attempt=2 customer=...` followed by `[tool:<Worker B's hostname>] lookup_customer_channel_preference COMPLETE attempt=2 customer=...` — the retry, on a different container hostname, completing normally.
 - `--timestamps` puts a wall-clock time on every line, so you can see the gap between Worker A's `START` and Worker B's `START attempt=2` directly in the terminal, without cross-referencing the Web UI.
 
-**Evidence to capture, in the Event History (Temporal Web UI):**
+**Evidence to capture, in the Event History (Temporal Web UI) — this is the proof that it's a genuine retry of one logical Activity, not a duplicate, and that the Workflow kept going:**
 
 - The first `model_request` Activity: scheduled, started, completed (once).
 - The `lookup_recent_transactions` `call_tool` Activity: scheduled, started, completed (once) — before the interruption.
-- The `lookup_customer_channel_preference` `call_tool` Activity: `ActivityTaskStarted` shows attempt 1 on Worker A's identity, then (after Worker A is killed) a further `ActivityTaskStarted` shows attempt 2 (or a fresh schedule, depending on how far attempt 1 got) on Worker B's identity — but **only one** `ActivityTaskScheduled` for this Activity, confirming it's a retry of the same logical step, not a duplicate. This is the same attempt/identity pair the `[tool:<hostname>] ... attempt=N` log lines already showed you directly.
+- The `lookup_customer_channel_preference` `call_tool` Activity: **only one** `ActivityTaskScheduled`, with the Timeline showing a second attempt (e.g. the `2 ·` prefix on that Activity's bar) and a recorded failure from the first attempt before it succeeds. That single `ActivityTaskScheduled` is what confirms this is a retry of the same logical step, not a duplicate — it doesn't, by itself, tell you *which* container ran which attempt; the per-attempt `Identity` field is available if you drill into that specific attempt, but the Worker-A/Worker-B attribution for this demo came from the logs above, not from reading this view.
 - The final `model_request` Activity: scheduled and completed only after the tool call above finishes.
 - `notify_customer`, the Signal, and the final `WorkflowExecutionCompleted` all proceed normally afterward.
 
