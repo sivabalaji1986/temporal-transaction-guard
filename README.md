@@ -128,6 +128,8 @@ If you change `UsageLimits` or either activity config, recalculate this budget �
 
 The `1s backoff` in the model-request calculation above is configurable via `DEMO_MODEL_RETRY_INTERVAL_SECONDS` (default `1`, matching the math above) — a demo/observability knob, like `DEMO_FAILOVER_DELAY_SECONDS` below, not something to widen for routine use. Raising it raises the 810s total and requires recalculating the same way. Because `Settings` reads `.env` from the current working directory, leaving either `DEMO_*` variable set locally after a demo also affects a native `pytest tests/` run, not just the running app — reset both to `0`/`1` when you're done.
 
+**Hand-written side-effect Activities** (`place_hold`, `release`, `block`, `escalate`, `notify_customer`, `record_no_hold_outcome`) are separate from the Agent-phase budget above — they're not part of the 810s figure, and changing them doesn't affect it — but they also no longer rely on Temporal's default unlimited retry policy. `fraud_hold_workflow.py` gives each of them an explicit `retry_policy=_SIDE_EFFECT_RETRY_POLICY` (`maximum_attempts=2`, 1-second initial backoff), alongside their existing 10-second `start_to_close_timeout`. This bounds how long the Workflow will keep retrying a failing side effect instead of retrying it forever — it does **not** make these Activities exactly-once. Temporal Activities are at-least-once regardless of retry policy, so a real (non-mocked) downstream integration still needs its own idempotency key — e.g. `f"{transaction_id}:HOLD"` / `f"{transaction_id}:RELEASE"` / `f"{transaction_id}:BLOCK"` / `f"{transaction_id}:ESCALATE"` — bounding the retry count only stops the Workflow from waiting on a failing side effect forever, it doesn't dedupe the effect itself.
+
 If you have stale local Temporal dev-server state, wipe it (`docker compose down -v`, or don't reuse an old `temporal server start-dev` data directory) before running this project — this is a small demo repo, so a clean-slate restart is the deliberate approach rather than a production-grade versioning strategy.
 
 ### How this shows up in Temporal's Event History
@@ -273,14 +275,14 @@ Get the repo ready to work with, and confirm it's in a working state, before run
    pip install -r requirements.txt
    ```
 
-4. Run the test suite. This does **not** require Temporal, Docker, or Ollama to be running — all 15 tests use mocked activities, Temporal's in-memory time-skipping test environment, `UnsandboxedWorkflowRunner` where needed for monkeypatching, and PydanticAI's deterministic `TestModel`/`FunctionModel` test doubles instead of a real Ollama call:
+4. Run the test suite. This does **not** require Temporal, Docker, or Ollama to be running — all 16 tests use mocked activities, Temporal's in-memory time-skipping test environment, `UnsandboxedWorkflowRunner` where needed for monkeypatching, and PydanticAI's deterministic `TestModel`/`FunctionModel` test doubles instead of a real Ollama call:
 
    ```bash
    pytest tests/ -v
    ```
 
-   Expected: `15 passed` across three files:
-   - `tests/test_fraud_hold_workflow.py` (5) — Workflow-level orchestration against the *real* `FraudHoldWorkflow`, with a test Agent substituted in via `monkeypatch` + `UnsandboxedWorkflowRunner`.
+   Expected: `16 passed` across three files:
+   - `tests/test_fraud_hold_workflow.py` (6) — Workflow-level orchestration against the *real* `FraudHoldWorkflow`, with a test Agent substituted in via `monkeypatch` + `UnsandboxedWorkflowRunner`, including a test proving the hand-written Activities' bounded retry policy is actually in effect.
    - `tests/test_generate_explanation_agent.py` (7) — Agent-level, called outside a Workflow (where `TemporalDurability` is transparent): tool registration/calling, real tool-return-value influence, customer-scoped tool data via `ctx.deps`, invalid-output rejection, no raw-data leakage, the bounded tool-calling loop.
    - `tests/test_generate_explanation_agent_durability.py` (3) — the fine-grained durability boundary itself: a completed tool Activity is proven *not* re-executed when a later model step fails and retries (verified via both an invocation counter and Temporal's own Event History), the usage-limits bound through the real Activity boundary, and a `Replayer`-based replay-determinism check.
 

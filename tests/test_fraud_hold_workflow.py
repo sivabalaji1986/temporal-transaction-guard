@@ -41,6 +41,7 @@ from pydantic_ai.durable_exec.temporal import PydanticAIPlugin, TemporalDurabili
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from temporalio import activity
+from temporalio.client import WorkflowFailureError
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
@@ -48,7 +49,7 @@ from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 from app.activities.generate_explanation import _BASE_ACTIVITY_CONFIG, _MODEL_ACTIVITY_CONFIG
 from app.models import CustomerResponse, InvestigationSummary, Transaction
 from app.workflows import fraud_hold_workflow as fraud_hold_workflow_module
-from app.workflows.fraud_hold_workflow import FraudHoldWorkflow
+from app.workflows.fraud_hold_workflow import _SIDE_EFFECT_RETRY_POLICY, FraudHoldWorkflow
 
 FRAUD_SCORE_THRESHOLD = 70
 
@@ -99,7 +100,9 @@ def make_test_agent(calls: list[str], fail: bool = False) -> Agent:
     )
 
 
-def make_mock_activities() -> tuple[list[str], list[str], list[Callable]]:
+def make_mock_activities(
+    place_hold_fails: bool = False,
+) -> tuple[list[str], list[str], list[Callable]]:
     calls: list[str] = []
     notify_messages: list[str] = []
 
@@ -110,6 +113,8 @@ def make_mock_activities() -> tuple[list[str], list[str], list[Callable]]:
     @activity.defn(name="place_hold")
     async def place_hold(transaction_id: str) -> None:
         calls.append("place_hold")
+        if place_hold_fails:
+            raise RuntimeError("simulated persistent hold-placement failure")
 
     @activity.defn(name="notify_customer")
     async def notify_customer(customer_id: str, message: str, notification_type: str) -> None:
@@ -336,3 +341,47 @@ async def test_ai_failure_falls_back_and_still_resolves(monkeypatch):
     assert len(notify_messages) == 1
     assert notify_messages[0] != "test explanation"
     assert "temporarily paused" in notify_messages[0]
+
+
+@pytest.mark.asyncio
+async def test_hand_written_activity_retries_are_bounded(monkeypatch):
+    """Temporal's own default RetryPolicy is unlimited (maximum_attempts=0).
+    If fraud_hold_workflow.py's `workflow.execute_activity(place_hold, ...)`
+    call didn't pass `retry_policy=_SIDE_EFFECT_RETRY_POLICY`, a
+    permanently-failing place_hold would retry forever and this test would
+    never complete. Scripting place_hold to always fail and asserting the
+    Workflow fails after exactly `_SIDE_EFFECT_RETRY_POLICY.maximum_attempts`
+    attempts -- not more, not hanging -- is the proof that the bounded
+    policy is actually wired up on this call, not Temporal's unbounded
+    default.
+    """
+    calls, _, activities = make_mock_activities(place_hold_fails=True)
+    test_agent = make_test_agent(calls)
+    monkeypatch.setattr(fraud_hold_workflow_module, "_agent", test_agent)
+    monkeypatch.setattr(FraudHoldWorkflow, "__pydantic_ai_agents__", [test_agent])
+
+    task_queue = str(uuid.uuid4())
+    async with await WorkflowEnvironment.start_time_skipping(
+        data_converter=pydantic_data_converter, plugins=[PydanticAIPlugin()]
+    ) as env:
+        async with Worker(
+            env.client,
+            task_queue=task_queue,
+            workflows=[FraudHoldWorkflow],
+            activities=activities,
+            # UnsandboxedWorkflowRunner(): see rationale comment on the first
+            # test above (test_below_threshold_records_no_hold_outcome).
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                FraudHoldWorkflow.run,
+                args=[make_transaction("TXN-HOLDFAIL", 90), FRAUD_SCORE_THRESHOLD],
+                id=str(uuid.uuid4()),
+                task_queue=task_queue,
+            )
+            with pytest.raises(WorkflowFailureError):
+                await handle.result()
+    assert calls.count("place_hold") == _SIDE_EFFECT_RETRY_POLICY.maximum_attempts
+    # The Agent was never reached -- place_hold's own retries were
+    # exhausted first, before the Workflow got anywhere near _agent.run(...).
+    assert "agent_investigation" not in calls

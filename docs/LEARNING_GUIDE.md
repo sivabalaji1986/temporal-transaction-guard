@@ -421,6 +421,7 @@ Let's look at the imports first:
 from datetime import timedelta
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError
 
 from app.models import CustomerResponse, InvestigationSummary, Transaction
@@ -433,13 +434,19 @@ with workflow.unsafe.imports_passed_through():
     from app.activities.hold import block, escalate, place_hold, release
     from app.activities.log_outcome import record_no_hold_outcome
     from app.activities.notify import notify_customer
+
+_SIDE_EFFECT_RETRY_POLICY = RetryPolicy(
+    maximum_attempts=2,
+    initial_interval=timedelta(seconds=1),
+)
 ```
 
 - **`timedelta`** — Python's standard-library way of representing a *duration* (as opposed to a specific point in time), e.g. `timedelta(hours=24)` or `timedelta(seconds=10)`.
 - **`with workflow.unsafe.imports_passed_through():`** — this is a Temporal-specific detail, not a general Python concept. Because workflow code gets replayed (see above), Temporal normally restricts what a workflow file is allowed to import, to catch accidentally non-deterministic code early. The activity files we're importing here (especially `generate_explanation.py`, which pulls in an AI library) don't actually run *inside* the workflow's replayed logic — the workflow only needs to hold a *reference* to the function (or, for `_agent`, to the whole Agent object) so it can tell Temporal "go run this, elsewhere." This block tells Temporal "trust me, these imports are safe to pass through without the usual restrictions."
 - **`with ... :`** itself is Python's **context manager** syntax — a way of saying "do some setup, run this block of code, then do some cleanup afterward, no matter what happens inside." We'll see a more hands-on example of this in Section 2.11, when tests use `async with`.
-- **This file imports the whole `_agent` object, not an Activity function.** It imports `_agent` (and its `_AGENT_USAGE_LIMITS`) straight from `generate_explanation.py`, and calls `_agent.run(...)` directly, further down — the Agent itself is the thing that gets called, not a separately importable `generate_explanation` function. `RetryPolicy` isn't imported here either: the Agent's own retry policies live where the Agent is defined (`_BASE_ACTIVITY_CONFIG`/`_MODEL_ACTIVITY_CONFIG` in `generate_explanation.py`, Section 2.6), not at each call site.
+- **This file imports the whole `_agent` object, not an Activity function.** It imports `_agent` (and its `_AGENT_USAGE_LIMITS`) straight from `generate_explanation.py`, and calls `_agent.run(...)` directly, further down — the Agent itself is the thing that gets called, not a separately importable `generate_explanation` function. The Agent's own retry policies still live where the Agent is defined (`_BASE_ACTIVITY_CONFIG`/`_MODEL_ACTIVITY_CONFIG` in `generate_explanation.py`, Section 2.6), not at each call site.
 - **`PydanticAIWorkflow` and `AgentRunError`** — both new imports, both from PydanticAI's `pydantic_ai.durable_exec.temporal`/`pydantic_ai.exceptions` modules rather than from this project's own code. `PydanticAIWorkflow` is a base class the workflow now inherits from (see below); `AgentRunError` is a new exception type this workflow's fallback needs to catch, alongside the already-familiar `ActivityError`.
+- **`_SIDE_EFFECT_RETRY_POLICY = RetryPolicy(maximum_attempts=2, initial_interval=timedelta(seconds=1))` — why does this file import `RetryPolicy` when `generate_explanation.py` already has its own?** Temporal's own default `RetryPolicy` has `maximum_attempts=0` (unlimited) — this applies separately to *every* Activity that doesn't pass its own `retry_policy=`, not just the Agent's. Without this constant, `place_hold`/`release`/`block`/`escalate`/`notify_customer`/`record_no_hold_outcome` (all plain, hand-written Activities — Sections 2.3–2.5) would each silently inherit that unbounded default. `_SIDE_EFFECT_RETRY_POLICY` is this Workflow's own explicit, bounded policy for exactly those six calls — a separate, deliberately identical-looking sibling to `_BASE_ACTIVITY_CONFIG` in `generate_explanation.py`, not the same object (the Agent's config is a `TemporalDurability`-specific `ActivityConfig` dict; this one is a plain `RetryPolicy` passed straight to `workflow.execute_activity(..., retry_policy=...)`). It bounds *retry count*, not effect count: Activities are still at-least-once regardless, so a real (non-mocked) downstream integration behind any of these six calls still needs its own idempotency key (e.g. `f"{transaction_id}:HOLD"`) — see the comment above this constant in the real source file for the fuller version of this note.
 
 Now the workflow class itself:
 
@@ -475,12 +482,13 @@ Now the main logic:
                 record_no_hold_outcome,
                 args=[transaction.transaction_id, transaction.fraud_score],
                 start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=_SIDE_EFFECT_RETRY_POLICY,
             )
             return "no_hold_needed"
 ```
 
 - **`@workflow.run`** — marks this as the workflow's main entry point — the method Temporal actually calls when a `FraudHoldWorkflow` is started. A workflow class can only have one of these.
-- **`workflow.execute_activity(record_no_hold_outcome, args=[...], start_to_close_timeout=...)`** — this is how a workflow calls an activity: give it the activity function itself (imported above), the arguments to pass, and — always required — a `start_to_close_timeout`, telling Temporal the longest this activity is allowed to take before being considered failed.
+- **`workflow.execute_activity(record_no_hold_outcome, args=[...], start_to_close_timeout=..., retry_policy=...)`** — this is how a workflow calls an activity: give it the activity function itself (imported above), the arguments to pass, a `start_to_close_timeout` (always required — the longest this activity is allowed to take before being considered failed), and here also `retry_policy=_SIDE_EFFECT_RETRY_POLICY` — without it, this call would fall back to Temporal's own default `RetryPolicy`, which is unlimited attempts.
 - This is the "threshold check" from Section 1, step 3: a plain `if` comparing two numbers already handed to the workflow. Nothing about it can vary between replays, so it's safe as ordinary code, with no activity needed.
 
 If the score is at or above the threshold, the hold happens first, deliberately before asking the AI for an explanation:
@@ -490,6 +498,7 @@ If the score is at or above the threshold, the hold happens first, deliberately 
             place_hold,
             transaction.transaction_id,
             start_to_close_timeout=timedelta(seconds=10),
+            retry_policy=_SIDE_EFFECT_RETRY_POLICY,
         )
 
         try:
@@ -525,6 +534,7 @@ If the score is at or above the threshold, the hold happens first, deliberately 
                 investigation.notification_type,
             ],
             start_to_close_timeout=timedelta(seconds=10),
+            retry_policy=_SIDE_EFFECT_RETRY_POLICY,
         )
 ```
 
@@ -551,6 +561,7 @@ Finally, the durable wait and resolution:
                 escalate,
                 transaction.transaction_id,
                 start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=_SIDE_EFFECT_RETRY_POLICY,
             )
             return "escalated_no_response"
 
@@ -560,6 +571,7 @@ Finally, the durable wait and resolution:
                 release,
                 transaction.transaction_id,
                 start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=_SIDE_EFFECT_RETRY_POLICY,
             )
             return "released"
 
@@ -567,6 +579,7 @@ Finally, the durable wait and resolution:
             block,
             transaction.transaction_id,
             start_to_close_timeout=timedelta(seconds=10),
+            retry_policy=_SIDE_EFFECT_RETRY_POLICY,
         )
         return "blocked"
 ```
@@ -805,7 +818,7 @@ if __name__ == "__main__":
 
 ### 2.11 `tests/test_fraud_hold_workflow.py` — **Test**
 
-**Job:** Five automated tests that exercise `FraudHoldWorkflow` end-to-end, without needing a real Temporal server, a real AI/Ollama, or Docker. (The full suite is 15 tests across three files — Section 2.12 covers seven that test the Agent directly, Section 2.13 covers three fine-grained-durability proofs.)
+**Job:** Six automated tests that exercise `FraudHoldWorkflow` end-to-end, without needing a real Temporal server, a real AI/Ollama, or Docker. (The full suite is 16 tests across three files — Section 2.12 covers seven that test the Agent directly, Section 2.13 covers three fine-grained-durability proofs.)
 
 **Why does this file replace the whole `_agent` object rather than faking a single named Activity?** The real `_agent.run(...)` (Section 2.7) generates a *variable* number of model-request and tool-call Activities, named after the Agent itself — there's no single Activity name a test could register a fake function under, the way `place_hold` or `notify_customer` can be faked by name. So instead, these tests swap out the whole `_agent` object the Workflow calls — using pytest's `monkeypatch` fixture — for a test-only Agent built the same way (`TemporalDurability`, same activity configs) but with a scripted `FunctionModel` instead of a real Ollama-backed one. Getting this working reliably required one extra, non-obvious piece, explained below: `workflow_runner=UnsandboxedWorkflowRunner()`.
 
@@ -1117,9 +1130,24 @@ Each of Temporal's core guarantees shows up as a specific, small piece of code i
 
 ### 4.2 Retries
 
-**Where:** `generate_explanation.py`'s `_BASE_ACTIVITY_CONFIG` and `_MODEL_ACTIVITY_CONFIG` (Section 2.6), passed into `_agent`'s `capabilities=[TemporalDurability(activity_config=..., model_activity_config=...)]`.
+Two separate, explicit retry policies cover every Activity this project calls — nothing is left on Temporal's own default:
 
-**What it does:** if a model-request or tool-call Activity fails, Temporal automatically retries it (up to 2 attempts total per Activity, at least 1 second apart) *without any retry loop written in this project's own code* — each individual model request or tool call is retried independently, not the whole investigation at once (Section 4.1 above). Every other activity call in `fraud_hold_workflow.py` (`place_hold`, `notify_customer`, and the rest) has no explicit `retry_policy=`, which means it falls back to Temporal's default Activity retry policy rather than any specific fixed number of attempts. The Agent's model/tool Activities get a deliberately explicit policy because Temporal's own *default* retry policy has `maximum_attempts=0` — meaning *unlimited* retries — which would leave the whole Agent investigation's wall-clock time completely unbounded if left unset; in a real, production system, every activity would generally want its own deliberately chosen retry limit, timeout, and idempotency behavior, rather than being left on Temporal's defaults by accident, but this demo mostly leans on the defaults for everything except the Agent's activities, for simplicity.
+```text
+Agent model/tool Activities
+    -> explicit retry policy configured through TemporalDurability
+       (_BASE_ACTIVITY_CONFIG / _MODEL_ACTIVITY_CONFIG, generate_explanation.py)
+
+Hand-written side-effect Activities
+    -> explicit retry policy configured in FraudHoldWorkflow
+       (_SIDE_EFFECT_RETRY_POLICY, fraud_hold_workflow.py)
+
+Both remain at-least-once
+    -> downstream idempotency is still required
+```
+
+**Where:** `generate_explanation.py`'s `_BASE_ACTIVITY_CONFIG` and `_MODEL_ACTIVITY_CONFIG` (Section 2.6), passed into `_agent`'s `capabilities=[TemporalDurability(activity_config=..., model_activity_config=...)]`; and `fraud_hold_workflow.py`'s `_SIDE_EFFECT_RETRY_POLICY` (Section 2.7), passed as `retry_policy=` to every `workflow.execute_activity(...)` call for `place_hold`, `release`, `block`, `escalate`, `notify_customer`, and `record_no_hold_outcome`.
+
+**What it does:** if a model-request or tool-call Activity fails, Temporal automatically retries it (up to 2 attempts total per Activity, at least 1 second apart) *without any retry loop written in this project's own code* — each individual model request or tool call is retried independently, not the whole investigation at once (Section 4.1 above). The six hand-written Activities get the same shape of explicit bound (`maximum_attempts=2`, 1-second initial backoff, via `_SIDE_EFFECT_RETRY_POLICY`) applied at their own call sites in `FraudHoldWorkflow.run`. Both policies exist for the same reason: Temporal's own *default* `RetryPolicy` has `maximum_attempts=0` — meaning *unlimited* retries — which would leave either the Agent investigation's wall-clock time, or a stuck side effect, completely unbounded if left unset. Bounding the retry count is **not** the same as making an Activity exactly-once — Activities are at-least-once regardless of retry policy, so a real (non-mocked) `place_hold`/`release`/`block`/`escalate`/`notify_customer` integration still needs its own idempotency key on the downstream side (e.g. `f"{transaction_id}:HOLD"`); the bounded policy only stops the Workflow from retrying a failing call forever, it doesn't dedupe the effect itself.
 
 **A concrete example of why this matters:** `_MODEL_ACTIVITY_CONFIG`'s `start_to_close_timeout` is 60 seconds per model-request Activity, `_BASE_ACTIVITY_CONFIG`'s is 10 seconds per tool-call Activity — both deliberately tied to real numbers, not picked out of thin air. Real, forced-cold-start local measurements against `qwen3.5:latest` (this project's configured default — see `.env.example`), using the actual system prompt and tool schemas, showed 13.6–17.1 seconds worst observed — so 60 seconds gives roughly 3.5x headroom over what was actually measured, not just a guess. Multiplied out against `_AGENT_USAGE_LIMITS` (Section 2.6: up to 6 model requests, up to 4 tool calls, each up to 2 attempts with a 1-second backoff), the worst-case Agent-phase budget comes to 6 × (60 + 1 + 60) + 4 × (10 + 1 + 10) = 726 + 84 = **810 seconds**, kept under this project's 900-second ceiling for the whole investigation. If you raise the Agent's `request_limit`/`tool_calls_limit` or change which Ollama model is configured, this calculation needs re-checking against the new worst case — see `AGENTS.md` rule 6. This is exactly the kind of thing Temporal's Event History makes visible that a normal application log might not: an `ActivityTaskStarted` event with `Attempt: 2`, and a `Last Failure` panel showing `"timeoutType": "TIMEOUT_TYPE_START_TO_CLOSE"` from attempt 1, tells you precisely what happened and when, for *each* individual model-request or tool-call Activity — open any workflow's Event History in the Temporal Web UI (`http://localhost:8233`) and look for the same pattern if you want to see it directly.
 
@@ -1159,7 +1187,7 @@ Each of Temporal's core guarantees shows up as a specific, small piece of code i
 
 ## 5. The Tests, Explained
 
-This project's test suite is 15 tests across three files, each testing a different layer: `tests/test_fraud_hold_workflow.py` (5 tests — the real `FraudHoldWorkflow`'s orchestration, Agent monkeypatched), `tests/test_generate_explanation_agent.py` (7 tests — the real Agent's own logic, no Workflow involved), and `tests/test_generate_explanation_agent_durability.py` (3 tests — the fine-grained `TemporalDurability` mechanism itself, through a dedicated test Workflow).
+This project's test suite is 16 tests across three files, each testing a different layer: `tests/test_fraud_hold_workflow.py` (6 tests — the real `FraudHoldWorkflow`'s orchestration, Agent monkeypatched), `tests/test_generate_explanation_agent.py` (7 tests — the real Agent's own logic, no Workflow involved), and `tests/test_generate_explanation_agent_durability.py` (3 tests — the fine-grained `TemporalDurability` mechanism itself, through a dedicated test Workflow).
 
 ### 5.1 What is mocking, and why do these tests replace real code with fake stand-ins?
 
@@ -1169,7 +1197,7 @@ This project's test suite is 15 tests across three files, each testing a differe
 
 (Also covered in Section 2.11.) It's a temporary, isolated Temporal test environment with time-skipping enabled — a *simulated* clock that automatically fast-forwards whenever a test is just waiting for a result. Without it, `test_timeout_escalates` (below) would need to actually wait 24 real hours to pass.
 
-Now, the five Workflow-level tests themselves (Section 5.8 covers the seven Agent-level tests, Section 5.9 covers the three fine-grained-durability tests):
+Now, the six Workflow-level tests themselves (Section 5.9 covers the seven Agent-level tests, Section 5.10 covers the three fine-grained-durability tests):
 
 ### 5.3 `test_below_threshold_records_no_hold_outcome`
 
@@ -1209,9 +1237,17 @@ Now, the five Workflow-level tests themselves (Section 5.8 covers the seven Agen
 
 **Asserts:** the result is still `"released"`; `"agent_investigation"` did run (it wasn't skipped — it was attempted and failed); `"notify_customer"` still ran; and, most specifically, the actual message captured in `notify_messages` is **not** the AI mock's normal success text (`"test explanation"`) and **does** contain `"temporarily paused"` — the exact fallback wording from `fraud_hold_workflow.py`.
 
-**What it proves:** this is the automated proof for Section 4.5 — that a total, repeated AI failure doesn't crash the workflow or leave the hold stuck, and that the customer genuinely receives the fallback message (not just that *some* message was sent). Note this fails via `ActivityError` here (the scripted model always raises inside its own model-request Activity, exhausting its retries) — Section 5.9's `test_agent_loop_is_bounded_through_the_durable_boundary` is the companion proof for the *other* caught exception type, `AgentRunError`.
+**What it proves:** this is the automated proof for Section 4.5 — that a total, repeated AI failure doesn't crash the workflow or leave the hold stuck, and that the customer genuinely receives the fallback message (not just that *some* message was sent). Note this fails via `ActivityError` here (the scripted model always raises inside its own model-request Activity, exhausting its retries) — Section 5.10's `test_agent_loop_is_bounded_through_the_durable_boundary` is the companion proof for the *other* caught exception type, `AgentRunError`.
 
-### 5.8 `tests/test_generate_explanation_agent.py` — the seven Agent-level tests
+### 5.8 `test_hand_written_activity_retries_are_bounded`
+
+**Scenario:** `place_hold` is scripted to always fail. The transaction is above threshold, so the Workflow reaches the `place_hold` call and keeps hitting that failure on every attempt.
+
+**Asserts:** the Workflow itself fails (`pytest.raises(WorkflowFailureError)` around `handle.result()`) rather than completing or hanging, and `calls.count("place_hold") == _SIDE_EFFECT_RETRY_POLICY.maximum_attempts` — exactly 2, imported from the real constant rather than hardcoded, so this test breaks loudly if that policy ever changes. Also asserts `"agent_investigation" not in calls`, confirming the Workflow never got past `place_hold` to reach the Agent.
+
+**What it proves:** `_SIDE_EFFECT_RETRY_POLICY` is genuinely wired into this specific `execute_activity` call, not just defined and unused. Temporal's own default `RetryPolicy` is unlimited (`maximum_attempts=0`) — without the explicit policy, a permanently-failing `place_hold` would retry forever and this test would never finish rather than failing predictably after 2 attempts. That the test completes quickly with a bounded count, instead of timing out, *is* the proof.
+
+### 5.9 `tests/test_generate_explanation_agent.py` — the seven Agent-level tests
 
 (Full walkthrough in Section 2.12; this is a quick-reference summary.) These seven call `_run_agent(...)` (a small test helper that calls `_agent.run(...)` the same way `fraud_hold_workflow.py` does), swapping `_agent`'s model for `TestModel` or `FunctionModel` via `_agent.override(...)` — no Workflow, no Worker, no Ollama, no Temporal server at all.
 
@@ -1225,9 +1261,9 @@ Now, the five Workflow-level tests themselves (Section 5.8 covers the seven Agen
 | `test_agent_loop_is_bounded` | A pathological, always-call-another-tool loop is actually stopped by the real, imported `_AGENT_USAGE_LIMITS` — not an unbounded loop — outside a Workflow. |
 | `test_tools_are_importable_and_registered` | The tool functions referenced throughout the tests and docs are the same ones actually registered on `_agent`. |
 
-### 5.9 `tests/test_generate_explanation_agent_durability.py` — the three fine-grained-durability tests
+### 5.10 `tests/test_generate_explanation_agent_durability.py` — the three fine-grained-durability tests
 
-(Full walkthrough in Section 2.13; this is a quick-reference summary.) These three run a dedicated test-only Agent and Workflow through a real (test) Temporal `Worker`, specifically to prove PydanticAI's `TemporalDurability` mechanism itself behaves correctly — not `FraudHoldWorkflow`'s own orchestration, which Section 5.3–5.7 already cover.
+(Full walkthrough in Section 2.13; this is a quick-reference summary.) These three run a dedicated test-only Agent and Workflow through a real (test) Temporal `Worker`, specifically to prove PydanticAI's `TemporalDurability` mechanism itself behaves correctly — not `FraudHoldWorkflow`'s own orchestration, which Section 5.3–5.8 already cover.
 
 | Test | What it proves |
 |---|---|

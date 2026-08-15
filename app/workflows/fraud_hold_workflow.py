@@ -31,6 +31,7 @@ docs/LEARNING_GUIDE.md Section 2.6 for the full explanation.
 from datetime import timedelta
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError
 
 from app.models import CustomerResponse, InvestigationSummary, Transaction
@@ -43,6 +44,25 @@ with workflow.unsafe.imports_passed_through():
     from app.activities.hold import block, escalate, place_hold, release
     from app.activities.log_outcome import record_no_hold_outcome
     from app.activities.notify import notify_customer
+
+# Explicit, bounded retry policy for the hand-written side-effect Activities
+# below (place_hold/release/block/escalate/notify_customer/
+# record_no_hold_outcome). Temporal's own default RetryPolicy has
+# maximum_attempts=0 (unlimited), which the Agent's model/tool Activities
+# already avoid via _BASE_ACTIVITY_CONFIG/_MODEL_ACTIVITY_CONFIG in
+# generate_explanation.py -- this gives these hand-written Activities the
+# same explicit ceiling, instead of silently inheriting the unbounded
+# default. This does not make these Activities exactly-once: Temporal
+# Activities are at-least-once regardless of the retry policy, so a real
+# (non-mocked) downstream integration still needs its own idempotency key,
+# e.g. f"{transaction_id}:HOLD" / f"{transaction_id}:RELEASE" /
+# f"{transaction_id}:BLOCK" / f"{transaction_id}:ESCALATE" -- bounding the
+# retry count only stops this Workflow from waiting on a failing side
+# effect forever, it doesn't dedupe the effect itself.
+_SIDE_EFFECT_RETRY_POLICY = RetryPolicy(
+    maximum_attempts=2,
+    initial_interval=timedelta(seconds=1),
+)
 
 
 @workflow.defn
@@ -76,6 +96,7 @@ class FraudHoldWorkflow(PydanticAIWorkflow):
                 record_no_hold_outcome,
                 args=[transaction.transaction_id, transaction.fraud_score],
                 start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=_SIDE_EFFECT_RETRY_POLICY,
             )
             return "no_hold_needed"
 
@@ -88,6 +109,7 @@ class FraudHoldWorkflow(PydanticAIWorkflow):
             place_hold,
             transaction.transaction_id,
             start_to_close_timeout=timedelta(seconds=10),
+            retry_policy=_SIDE_EFFECT_RETRY_POLICY,
         )
 
         # If the Agent fails even after its activities' retries (e.g. Ollama
@@ -142,6 +164,7 @@ class FraudHoldWorkflow(PydanticAIWorkflow):
                 investigation.notification_type,
             ],
             start_to_close_timeout=timedelta(seconds=10),
+            retry_policy=_SIDE_EFFECT_RETRY_POLICY,
         )
 
         try:
@@ -154,6 +177,7 @@ class FraudHoldWorkflow(PydanticAIWorkflow):
                 escalate,
                 transaction.transaction_id,
                 start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=_SIDE_EFFECT_RETRY_POLICY,
             )
             return "escalated_no_response"
 
@@ -163,6 +187,7 @@ class FraudHoldWorkflow(PydanticAIWorkflow):
                 release,
                 transaction.transaction_id,
                 start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=_SIDE_EFFECT_RETRY_POLICY,
             )
             return "released"
 
@@ -170,5 +195,6 @@ class FraudHoldWorkflow(PydanticAIWorkflow):
             block,
             transaction.transaction_id,
             start_to_close_timeout=timedelta(seconds=10),
+            retry_policy=_SIDE_EFFECT_RETRY_POLICY,
         )
         return "blocked"

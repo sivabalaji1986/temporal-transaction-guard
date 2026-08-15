@@ -108,9 +108,13 @@ activity logic. For a general walkthrough, see `README.md` and
     `UnsandboxedWorkflowRunner()` from the Workflow-path tests thinking it's
     redundant with that determinism test; they cover different things.
 
-11. **All existing tests must stay green**, currently 15 across
-    `tests/test_fraud_hold_workflow.py` (5, Workflow-level, mocked
-    activities + monkeypatched test Agent),
+11. **All existing tests must stay green**, currently 16 across
+    `tests/test_fraud_hold_workflow.py` (6, Workflow-level, mocked
+    activities + monkeypatched test Agent — including
+    `test_hand_written_activity_retries_are_bounded`, proving
+    `place_hold`'s `retry_policy=_SIDE_EFFECT_RETRY_POLICY` actually bounds
+    it to `maximum_attempts=2` rather than inheriting Temporal's unlimited
+    default),
     `tests/test_generate_explanation_agent.py` (7, Agent-level,
     `TestModel`/`FunctionModel`, no Temporal Workflow, no real Ollama), and
     `tests/test_generate_explanation_agent_durability.py` (3, fine-grained
