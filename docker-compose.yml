@@ -51,6 +51,7 @@ services:
       # Demo-only, 0/off unless explicitly set -- see README's "Demo C"
       # (Worker-pod failover) and app/activities/generate_explanation.py.
       - DEMO_FAILOVER_DELAY_SECONDS=${DEMO_FAILOVER_DELAY_SECONDS:-0}
+      - DEMO_MODEL_RETRY_INTERVAL_SECONDS=${DEMO_MODEL_RETRY_INTERVAL_SECONDS:-1}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
