@@ -1,4 +1,5 @@
 import asyncio
+import socket
 from datetime import timedelta
 from typing import Literal
 
@@ -7,11 +8,20 @@ from pydantic_ai.durable_exec.temporal import TemporalDurability
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import UsageLimits
+from temporalio import activity
 from temporalio.common import RetryPolicy
 from temporalio.workflow import ActivityConfig
 
 from app.config import settings
 from app.models import InvestigationSummary
+
+# Same hostname style as hold.py/notify.py/log_outcome.py -- lets
+# `docker compose logs -f worker` (with multiple replicas, e.g.
+# `--scale worker=2`) show which container executed which tool-call
+# Activity attempt. Purely informational: reading the hostname here has no
+# effect on Workflow determinism (this runs inside an Activity, never
+# inside Workflow code).
+_WORKER_HOSTNAME = socket.gethostname()
 
 # Bounds the Agent's tool-calling/reasoning loop for a single agent.run()
 # call. The normal path needs at most 3 model requests (decide to call a
@@ -144,6 +154,17 @@ async def lookup_customer_channel_preference(
     ctx: RunContext[str],
 ) -> Literal["sms", "email", "push"]:
     """Read-only mock: this customer's preferred notification channel."""
+    # Attempt number from the real Temporal Activity context (this function
+    # body runs inside PydanticAI's `call_tool_activity`, an @activity.defn
+    # function -- confirmed by reading pydantic_ai.durable_exec.temporal's
+    # source). Outside a Workflow (e.g. tests that call `_agent.run(...)`
+    # directly, per AGENTS.md) there is no Activity context, so
+    # `activity.in_activity()` is False and attempt falls back to "n/a".
+    attempt = activity.info().attempt if activity.in_activity() else "n/a"
+    print(
+        f"[tool:{_WORKER_HOSTNAME}] lookup_customer_channel_preference START "
+        f"attempt={attempt} customer={ctx.deps}"
+    )
     # settings.demo_failover_delay_seconds is 0 in every normal run
     # (default, and every automated test). It exists solely for the manual
     # Worker-pod-failover demo (README, "Demo C") -- set via the
@@ -156,4 +177,9 @@ async def lookup_customer_channel_preference(
     # model/tool boundary itself.
     if settings.demo_failover_delay_seconds > 0:
         await asyncio.sleep(settings.demo_failover_delay_seconds)
-    return _MOCK_CHANNEL_PREFERENCES.get(ctx.deps, _DEFAULT_CHANNEL_PREFERENCE)
+    result = _MOCK_CHANNEL_PREFERENCES.get(ctx.deps, _DEFAULT_CHANNEL_PREFERENCE)
+    print(
+        f"[tool:{_WORKER_HOSTNAME}] lookup_customer_channel_preference COMPLETE "
+        f"attempt={attempt} customer={ctx.deps}"
+    )
+    return result

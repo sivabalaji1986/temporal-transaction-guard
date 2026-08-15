@@ -508,10 +508,10 @@ Proves cross-Worker failover for an in-flight Agent Activity: when the Worker co
 
 ```bash
 docker compose up --build --scale worker=2
-docker compose logs -f worker   # watch both replicas' output, prefixed by container name
+docker compose logs -f --timestamps worker   # watch both replicas' output, prefixed by container name
 ```
 
-Each replica logs its own container hostname on startup (`Worker started (worker-<hostname>), polling task queue...`) and on every mocked-activity print line (`[hold:<hostname>] ...`, etc.) — that's how you'll tell them apart.
+Each replica logs its own container hostname on startup (`Worker started (worker-<hostname>), polling task queue...`) and on every mocked-activity print line (`[hold:<hostname>] ...`, etc.) — that's how you'll tell them apart. `lookup_customer_channel_preference` additionally logs its own START/COMPLETE lines with the Activity's attempt number: `[tool:<hostname>] lookup_customer_channel_preference START attempt=1 customer=CUST-101`. `--timestamps` adds a wall-clock time to every line Docker prints — there's no timestamp logic in the application code itself, so this is the only thing that dates these lines.
 
 **Make the interruption window reproducible**, rather than racing a live Ollama call's variable timing: set `DEMO_FAILOVER_DELAY_SECONDS=8` in `.env` before bringing the stack up, or export it before `docker compose up`. This adds a plain `asyncio.sleep(8)` inside the `lookup_customer_channel_preference` tool — the *second* of the Agent's two read-only tools, which the Agent typically calls in the same turn as the first — giving you a predictable window to identify and kill a Worker while a real Activity is genuinely in-flight. `8` is deliberately below the tool-call Activity's 10-second `start_to_close_timeout` (see [Timeout and retry budget](#timeout-and-retry-budget)): with the Worker left running normally, the delayed call still completes before its timeout and the Agent continues normally — the delay creates an interruption window, it doesn't force a timeout. Setting it above `10` would instead guarantee the Activity times out on its own, driving the Agent into its deterministic fallback regardless of whether a Worker is ever killed, which is not what this demo is meant to show. It's `0` (off) by default everywhere else, including every automated test, and it only ever delays this one already-read-only, already-idempotent Activity — it doesn't touch Workflow code, `customer_id` handling, or bypass `TemporalDurability` in any way.
 
@@ -520,17 +520,23 @@ Each replica logs its own container hostname on startup (`Worker started (worker
 **Sequence:**
 
 1. Fire the `hold` curl example (above) with a fraud score at/above the threshold.
-2. Watch the Web UI's Event History: confirm `agent__fraud_hold_investigator__model_request` (turn 1) and `agent__fraud_hold_investigator__toolset__<agent>__call_tool` for `lookup_recent_transactions` have both completed, and a `call_tool` Activity for `lookup_customer_channel_preference` is now running (its `ActivityTaskStarted` event's `Identity` field names one of your two Worker containers — that's "Worker A").
-3. Kill Worker A specifically: `docker compose stop <the container name shown in Identity/logs>` (find it with `docker compose ps`).
-4. Watch the logs: Worker B (the surviving replica) picks up the retry. The delayed tool call succeeds on Worker B; the Agent continues to its final model turn, which also runs on whichever Worker is free (commonly B).
+2. Watch the Worker logs (`docker compose logs -f --timestamps worker`) or the Web UI's Event History: confirm `agent__fraud_hold_investigator__model_request` (turn 1) and `agent__fraud_hold_investigator__toolset__<agent>__call_tool` for `lookup_recent_transactions` have both completed, then wait for a `[tool:<hostname>] lookup_customer_channel_preference START attempt=1 customer=...` log line — its hostname is "Worker A" (the same hostname the Event History's `ActivityTaskStarted` `Identity` field would show for this attempt).
+3. Kill Worker A specifically: `docker compose stop <the container name shown in the log line/Identity field>` (find it with `docker compose ps`).
+4. Watch the logs: Worker B (the surviving replica) picks up the retry — a second `[tool:<hostname>] lookup_customer_channel_preference START attempt=2 customer=...` line appears, this time with Worker B's hostname, followed by its `COMPLETE` line. The Agent continues to its final model turn, which also runs on whichever Worker is free (commonly B).
 5. The investigation completes normally: `InvestigationSummary` produced, customer notified, workflow durably waiting again.
 6. Send the `respond` curl example — the workflow resolves (`release`/`block`) exactly as in Demo A.
 
-**Evidence to capture in the Event History:**
+**Evidence to capture, in the Worker logs (`docker compose logs -f --timestamps worker`):**
+
+- `[tool:<Worker A's hostname>] lookup_customer_channel_preference START attempt=1 customer=...` — no matching `COMPLETE` line for that attempt, since Worker A was killed while it was in flight.
+- `[tool:<Worker B's hostname>] lookup_customer_channel_preference START attempt=2 customer=...` followed by `[tool:<Worker B's hostname>] lookup_customer_channel_preference COMPLETE attempt=2 customer=...` — the retry, on a different container hostname, completing normally.
+- `--timestamps` puts a wall-clock time on every line, so you can see the gap between Worker A's `START` and Worker B's `START attempt=2` directly in the terminal, without cross-referencing the Web UI.
+
+**Evidence to capture, in the Event History (Temporal Web UI):**
 
 - The first `model_request` Activity: scheduled, started, completed (once).
 - The `lookup_recent_transactions` `call_tool` Activity: scheduled, started, completed (once) — before the interruption.
-- The `lookup_customer_channel_preference` `call_tool` Activity: `ActivityTaskStarted` shows attempt 1 on Worker A's identity, then (after Worker A is killed) a further `ActivityTaskStarted` shows attempt 2 (or a fresh schedule, depending on how far attempt 1 got) on Worker B's identity — but **only one** `ActivityTaskScheduled` for this Activity, confirming it's a retry of the same logical step, not a duplicate.
+- The `lookup_customer_channel_preference` `call_tool` Activity: `ActivityTaskStarted` shows attempt 1 on Worker A's identity, then (after Worker A is killed) a further `ActivityTaskStarted` shows attempt 2 (or a fresh schedule, depending on how far attempt 1 got) on Worker B's identity — but **only one** `ActivityTaskScheduled` for this Activity, confirming it's a retry of the same logical step, not a duplicate. This is the same attempt/identity pair the `[tool:<hostname>] ... attempt=N` log lines already showed you directly.
 - The final `model_request` Activity: scheduled and completed only after the tool call above finishes.
 - `notify_customer`, the Signal, and the final `WorkflowExecutionCompleted` all proceed normally afterward.
 

@@ -246,6 +246,7 @@ Same pattern again. The one thing worth noting: this function takes *three* plai
 
 ```python
 import asyncio
+import socket
 from datetime import timedelta
 from typing import Literal
 
@@ -254,11 +255,14 @@ from pydantic_ai.durable_exec.temporal import TemporalDurability
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import UsageLimits
+from temporalio import activity
 from temporalio.common import RetryPolicy
 from temporalio.workflow import ActivityConfig
 
 from app.config import settings
 from app.models import InvestigationSummary
+
+_WORKER_HOSTNAME = socket.gethostname()
 
 _AGENT_USAGE_LIMITS = UsageLimits(request_limit=6, tool_calls_limit=4)
 
@@ -342,9 +346,19 @@ async def lookup_customer_channel_preference(
     ctx: RunContext[str],
 ) -> Literal["sms", "email", "push"]:
     """Read-only mock: this customer's preferred notification channel."""
+    attempt = activity.info().attempt if activity.in_activity() else "n/a"
+    print(
+        f"[tool:{_WORKER_HOSTNAME}] lookup_customer_channel_preference START "
+        f"attempt={attempt} customer={ctx.deps}"
+    )
     if settings.demo_failover_delay_seconds > 0:
         await asyncio.sleep(settings.demo_failover_delay_seconds)
-    return _MOCK_CHANNEL_PREFERENCES.get(ctx.deps, _DEFAULT_CHANNEL_PREFERENCE)
+    result = _MOCK_CHANNEL_PREFERENCES.get(ctx.deps, _DEFAULT_CHANNEL_PREFERENCE)
+    print(
+        f"[tool:{_WORKER_HOSTNAME}] lookup_customer_channel_preference COMPLETE "
+        f"attempt={attempt} customer={ctx.deps}"
+    )
+    return result
 ```
 
 **New concepts, explained:**
@@ -362,6 +376,8 @@ async def lookup_customer_channel_preference(
 - **`RunContext[str]`** — the first parameter of a context-aware tool. `ctx.deps` gives the tool access to whatever was passed as `deps=` to `_agent.run(...)` — here, the `customer_id` string. Because `ctx` isn't a normal argument the *model* fills in (PydanticAI excludes it from the tool's schema), the model can never choose or override which customer's data these tools look up. This holds even now that tool calls cross a real Temporal Activity boundary: `deps` rides to the Activity as its own separate, typed parameter, never folded into the model-visible `tool_args` — see `AGENTS.md` rule 9.
 - **The two tools are deliberately read-only and return customer-scoped mock data** — `lookup_recent_transactions` and `lookup_customer_channel_preference` don't call any real system; they look up `ctx.deps` (the `customer_id`) in the small, hardcoded `_MOCK_RECENT_TRANSACTIONS`/`_MOCK_CHANNEL_PREFERENCES` dicts above, so `CUST-101` and `CUST-202` genuinely get different results, with a safe default (empty list / `"sms"`) for any other customer_id.
 - **The `asyncio.sleep` inside `lookup_customer_channel_preference` — what is that, and is it always active?** No — `settings.demo_failover_delay_seconds` defaults to `0`, meaning this `if` is false and the sleep never happens in normal operation, including every automated test. It's a demo-only hook: setting the `DEMO_FAILOVER_DELAY_SECONDS` environment variable gives a manual two-Worker failover demo (README's "Demo C") a predictable window where this specific tool-call Activity is genuinely in-flight, long enough to reliably kill one Worker process and watch a second one pick up the retry. Demo C's suggested value is `8` seconds — deliberately below this Activity's 10-second `start_to_close_timeout` (`_BASE_ACTIVITY_CONFIG`, above), so with the Worker left running normally the delayed call still finishes inside its timeout and the Agent continues as usual; the delay only needs to open an interruption window, not force the Activity to fail. Setting it at or above `10` would make the Activity time out on its own regardless of whether a Worker is ever killed. It only ever delays this one Activity — it changes nothing about Workflow code, `customer_id` handling, or the `TemporalDurability` boundary itself.
+- **The `print(...)` calls around it — why log START/COMPLETE with an attempt number, when `place_hold`/`notify_customer`/etc. just log one line?** This is the specific tool Demo C interrupts and retries (see above), so being able to tell attempts and Worker containers apart in a plain `docker compose logs` stream — without needing the Web UI open — is genuinely useful here in a way it isn't for the other, never-interrupted activities. `activity.info().attempt` (from `temporalio.activity`, the same package as `@activity.defn` elsewhere in this project) is the attempt number of the *real* Temporal Activity this tool call is currently running as — logging it directly next to `_WORKER_HOSTNAME` is what lets a single `docker compose logs -f --timestamps worker` stream show, in order, which container started attempt 1, that it never completed (Worker A was killed), and which different container started and completed attempt 2.
+- **`activity.in_activity()` before calling `activity.info()` — why the check?** `activity.info()` raises `RuntimeError` if there's no Activity context to report on. Inside a real Workflow, `TemporalDurability` runs this tool call as a genuine Temporal Activity (Section 2.6's opening explanation), so the check passes and `activity.info().attempt` is real. But `tests/test_generate_explanation_agent.py` (Section 2.12) calls `_agent.run(...)` directly, with no Workflow and no Activity boundary at all — there, `activity.in_activity()` is `False`, and `attempt` falls back to the string `"n/a"` instead of raising.
 - **Why does a Temporal retry only re-run the failed step, not the whole Agent loop?** Each model request and each tool call is tracked as its own independent Activity in Temporal's Event History: if, say, `lookup_recent_transactions` already succeeded and got recorded, and the *next* model request then fails, only that failing model-request Activity retries — the already-completed tool call isn't re-invoked. `tests/test_generate_explanation_agent_durability.py` (Section 2.13) proves this directly, by scripting exactly this scenario and asserting the tool only ran once.
 - **Why can't the Agent perform an actual banking action?** Structurally, not just by instruction: the only tools registered on `_agent` are the two read-only lookups above. There is no `release`, `block`, `escalate`, or `place_hold` tool anywhere near the Agent's tool list — those functions live in `hold.py` and are only ever called directly by the *Workflow* (Section 2.7), never passed to `Agent(...)`. Even a fully "jailbroken" model talking to this Agent has nothing it could call to move money.
 - **`UsageLimits(request_limit=6, tool_calls_limit=4)`** — the explicit bound on the Agent's loop, passed to `_agent.run(...)` as `usage_limits=` (Section 2.7 shows exactly where). Without it, a model that kept deciding "call one more tool" could in principle loop for a very long time. `request_limit` caps how many separate calls to the model itself can happen in one run; `tool_calls_limit` caps how many tool invocations total. Exceeding either raises `pydantic_ai.exceptions.UsageLimitExceeded`, a subclass of `pydantic_ai.exceptions.AgentRunError` — which, unlike a plain Temporal `ActivityError`, propagates *directly* from `_agent.run(...)` in Workflow code (Section 2.7 explains why the Workflow's `except` clause now needs to catch both types).
@@ -1118,7 +1134,7 @@ Each of Temporal's core guarantees shows up as a specific, small piece of code i
 
 **Where:** `app/worker.py`'s `WORKER_IDENTITY = f"worker-{socket.gethostname()}"` and `identity=WORKER_IDENTITY` on `Client.connect(...)` (Section 2.8); `docker-compose.yml`'s `worker` service, deliberately built with no `container_name` and no fixed host port so it can be scaled.
 
-**What it does:** this project's durability guarantee — a killed worker doesn't lose progress — holds even with only *one* worker process (a restarted single worker picks its own old work back up, as Sections 4.1 and 4.2 describe). Running `docker compose up --scale worker=2` goes one step further: two independent worker processes poll the *same* task queue at once, and Temporal itself decides which one picks up which piece of work, including retrying a step on whichever worker is available if the one that started it is killed mid-Activity. `WORKER_IDENTITY` is what makes this observable rather than just theoretically true — Docker gives each scaled replica a distinct container hostname by default, so each worker's `Client.connect(identity=...)` ends up visibly different, and every Activity attempt any worker executes is tagged with its identity in Temporal's Event History (the "Identity" field on `ActivityTaskStarted` events) — including the Agent's own model-request/tool-call Activities, which this project's own Python code never writes a log line for. `README.md`'s "Demo C" is the guided, manual walkthrough of killing one replica mid-investigation (using the `DEMO_FAILOVER_DELAY_SECONDS` hook from Section 2.6) and confirming, from the Event History, that a *different* worker identity picked up the retry.
+**What it does:** this project's durability guarantee — a killed worker doesn't lose progress — holds even with only *one* worker process (a restarted single worker picks its own old work back up, as Sections 4.1 and 4.2 describe). Running `docker compose up --scale worker=2` goes one step further: two independent worker processes poll the *same* task queue at once, and Temporal itself decides which one picks up which piece of work, including retrying a step on whichever worker is available if the one that started it is killed mid-Activity. `WORKER_IDENTITY` is what makes this observable rather than just theoretically true — Docker gives each scaled replica a distinct container hostname by default, so each worker's `Client.connect(identity=...)` ends up visibly different, and every Activity attempt any worker executes is tagged with its identity in Temporal's Event History (the "Identity" field on `ActivityTaskStarted` events) — including the Agent's own model-request/tool-call Activities, most of which this project's own Python code never writes a log line for. `lookup_customer_channel_preference` (Section 2.6) is the one exception: its `[tool:<hostname>] ... START/COMPLETE attempt=N` print lines exist specifically because it's the Activity Demo C interrupts and retries, so seeing the attempt/hostname pair directly in `docker compose logs` — not just the Event History — is worth the two extra print calls. `README.md`'s "Demo C" is the guided, manual walkthrough of killing one replica mid-investigation (using the `DEMO_FAILOVER_DELAY_SECONDS` hook from Section 2.6) and confirming, from both the Worker logs and the Event History, that a *different* worker identity picked up the retry.
 
 **An honest scope note, carried over from `README.md`:** the reproducible interruption point Demo C actually uses is a tool-call Activity (`lookup_customer_channel_preference`), not a model-request Activity specifically — delaying a model-request Activity on demand would require patching PydanticAI's own internal activity functions, which is out of scope (private API, not something this project's code should reach into). The failover behavior being demonstrated — a different worker identity resuming an in-flight Agent investigation after one worker is killed — is the same either way; only which *specific* step gets artificially slowed down for the demo differs from the most literal reading of "delay the model call."
 
