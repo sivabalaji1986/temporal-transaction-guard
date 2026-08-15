@@ -2,6 +2,8 @@
 
 A durable **hold → investigate → notify → wait → resolve** workflow for suspicious transactions, built on [Temporal](https://temporal.io), [FastAPI](https://fastapi.tiangolo.com), a tool-using [PydanticAI](https://ai.pydantic.dev) Agent running through PydanticAI's `TemporalDurability` capability, and a local [Ollama](https://ollama.com) model.
 
+This README covers install/run/demo instructions. For a from-scratch, file-by-file walkthrough of how the code works (aimed at readers new to Python or this codebase), see [`docs/LEARNING_GUIDE.md`](docs/LEARNING_GUIDE.md).
+
 > **Agentic investigation, deterministic action.** The AI Agent may autonomously gather additional read-only context before writing its explanation, but it never decides whether to hold, release, block, or escalate a transaction — that stays entirely in the Temporal Workflow.
 
 > **Fine-grained durability.** The Agent's `agent.run(...)` call executes directly inside the Workflow. Each individual model request and each individual tool call becomes its own Temporal Activity, separately recorded in Event History — not one opaque Activity containing the whole investigation. A Worker failure partway through an investigation does not force the whole thing to restart: whatever model/tool steps already completed are preserved and are not re-executed on resume, only the interrupted step retries.
@@ -196,6 +198,8 @@ temporal-transaction-guard/
 ├── .github/
 │   └── workflows/
 │       └── tests.yml
+├── docs/
+│   └── LEARNING_GUIDE.md                  # File-by-file walkthrough for readers new to Python/this codebase
 ├── app/
 │   ├── main.py
 │   ├── models.py
@@ -362,14 +366,14 @@ uvicorn app.main:app --reload
 
 ```bash
 docker compose ps              # temporal, api, worker should all show as Up
-docker compose logs -f worker  # look for "Worker started, polling task queue..."
+docker compose logs -f worker  # look for "Worker started (worker-<hostname>), polling task queue..."
 ```
 
 Then open `http://localhost:8233` in your browser for the Temporal Web UI.
 
 **Native (Option B):**
 
-Check the worker's own terminal (terminal 2 above) for `Worker started, polling task queue '...'`, then open `http://localhost:8233` (Temporal Web UI — `temporal server start-dev` serves this too) and `http://localhost:8000/docs` (FastAPI's interactive docs) in your browser to confirm both processes are up.
+Check the worker's own terminal (terminal 2 above) for `Worker started (worker-<hostname>), polling task queue '...'`, then open `http://localhost:8233` (Temporal Web UI — `temporal server start-dev` serves this too) and `http://localhost:8000/docs` (FastAPI's interactive docs) in your browser to confirm both processes are up.
 
 There's no `/health` endpoint on the API today — `/docs` (FastAPI's built-in Swagger UI, on by default) is the honest way to confirm it's responding without one. A dedicated health-check endpoint would be a reasonable future addition, but that's out of scope for this doc-only pass.
 

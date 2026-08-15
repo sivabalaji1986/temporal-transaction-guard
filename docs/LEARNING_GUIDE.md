@@ -141,14 +141,17 @@ settings = Settings()
 
 ```python
 import asyncio
+import socket
 
 from temporalio import activity
+
+_WORKER_HOSTNAME = socket.gethostname()
 
 
 @activity.defn
 async def record_no_hold_outcome(transaction_id: str, fraud_score: float) -> None:
     print(
-        f"[log_outcome] {transaction_id}: fraud_score={fraud_score} "
+        f"[log_outcome:{_WORKER_HOSTNAME}] {transaction_id}: fraud_score={fraud_score} "
         "below threshold, no hold placed"
     )
     await asyncio.sleep(1)
@@ -162,8 +165,9 @@ async def record_no_hold_outcome(transaction_id: str, fraud_score: float) -> Non
 - **`async def` / `await`** — `async def` marks a function as *asynchronous*: it's allowed to pause partway through (at an `await`) and let other work happen, instead of blocking everything until it finishes. `await asyncio.sleep(1)` pauses this specific function for 1 second without freezing the rest of the program. You can only use `await` inside a function defined with `async def`. Temporal activities and workflows in this project are always written as `async def` — this lets a single worker process handle many activities "at once" (really: taking turns whenever one of them is waiting on something, like a sleep or a network call). (If you know Java: this is a rough analogue to chaining `CompletableFuture`s — both let one thread juggle multiple pending operations instead of blocking on each one — but it's an approximation, not an exact match; Python's `async`/`await` reads more like ordinary sequential code, with the pause points made explicit by `await`.)
 - **`-> None`** — a type hint on the *return value* this time, meaning "this function doesn't return anything meaningful."
 - **f-strings (`f"..."`)** — the `f` right before a string means you can drop variables directly inside it using `{curly braces}`, e.g. `f"...{transaction_id}..."` inserts the actual value of `transaction_id` into the text.
+- **`_WORKER_HOSTNAME = socket.gethostname()`** — every activity in this project prints this alongside its own category tag (`[log_outcome:<hostname>]` here; `[hold:<hostname>]`, `[notify:<hostname>]`, `[tool:<hostname>]` elsewhere), so a log stream from multiple Worker containers (e.g. `docker compose logs -f worker` with `--scale worker=2`) shows which container ran which line. Sections 2.6 and 4.7 cover why this matters most for the two-Worker failover demo specifically.
 
-**Calls out to:** nothing — just `print` and `asyncio.sleep`, both from Python's standard library.
+**Calls out to:** `socket.gethostname()`, `print`, and `asyncio.sleep`, all from Python's standard library.
 **Called by:** `fraud_hold_workflow.py` (below-threshold path), `worker.py` (registers it so it *can* be called).
 
 **Data flow:** in — `transaction_id` and `fraud_score` (plain strings/numbers, not the full `Transaction` object). Out — nothing (`None`); its only real "output" is the printed line.
@@ -176,37 +180,46 @@ async def record_no_hold_outcome(transaction_id: str, fraud_score: float) -> Non
 
 ```python
 import asyncio
+import socket
 
 from temporalio import activity
+
+_WORKER_HOSTNAME = socket.gethostname()
 
 
 @activity.defn
 async def place_hold(transaction_id: str) -> None:
-    print(f"[hold] placing temporary hold on {transaction_id}")
+    print(f"[hold:{_WORKER_HOSTNAME}] placing temporary hold on {transaction_id}")
     await asyncio.sleep(1)
 
 
 @activity.defn
 async def release(transaction_id: str) -> None:
-    print(f"[hold] releasing hold on {transaction_id}: customer confirmed it was them")
+    print(
+        f"[hold:{_WORKER_HOSTNAME}] releasing hold on {transaction_id}: "
+        "customer confirmed it was them"
+    )
     await asyncio.sleep(1)
 
 
 @activity.defn
 async def block(transaction_id: str) -> None:
-    print(f"[hold] blocking {transaction_id}: customer says this wasn't them")
+    print(f"[hold:{_WORKER_HOSTNAME}] blocking {transaction_id}: customer says this wasn't them")
     await asyncio.sleep(1)
 
 
 @activity.defn
 async def escalate(transaction_id: str) -> None:
-    print(f"[hold] escalating {transaction_id} for manual review: no customer response")
+    print(
+        f"[hold:{_WORKER_HOSTNAME}] escalating {transaction_id} for manual "
+        "review: no customer response"
+    )
     await asyncio.sleep(1)
 ```
 
-No new Python concepts here — it's the same pattern as `log_outcome.py`, repeated four times. Worth noticing: **one file can define several activities.** They don't have to live one-per-file; they're grouped here because they're all "things that happen to a hold."
+No new Python concepts here — it's the same pattern as `log_outcome.py`, repeated four times (including the same `_WORKER_HOSTNAME` prefix — see Section 2.3). Worth noticing: **one file can define several activities.** They don't have to live one-per-file; they're grouped here because they're all "things that happen to a hold."
 
-**Calls out to:** nothing.
+**Calls out to:** `socket.gethostname()` (standard library).
 **Called by:** `fraud_hold_workflow.py` (`place_hold` always, then exactly one of `release`/`block`/`escalate` depending on how the case resolves), `worker.py`.
 
 **Data flow:** in — `transaction_id` only. Out — nothing.
@@ -219,19 +232,22 @@ No new Python concepts here — it's the same pattern as `log_outcome.py`, repea
 
 ```python
 import asyncio
+import socket
 
 from temporalio import activity
+
+_WORKER_HOSTNAME = socket.gethostname()
 
 
 @activity.defn
 async def notify_customer(customer_id: str, message: str, notification_type: str) -> None:
-    print(f"[notify] sending {notification_type} to {customer_id}: {message}")
+    print(f"[notify:{_WORKER_HOSTNAME}] sending {notification_type} to {customer_id}: {message}")
     await asyncio.sleep(1)
 ```
 
-Same pattern again. The one thing worth noting: this function takes *three* plain arguments (`customer_id`, `message`, `notification_type`) rather than a whole object — we'll see in Section 2.7 that the workflow pulls these three values out of an `InvestigationSummary` before calling this.
+Same pattern again, including the `_WORKER_HOSTNAME` prefix (Section 2.3). The one thing worth noting: this function takes *three* plain arguments (`customer_id`, `message`, `notification_type`) rather than a whole object — we'll see in Section 2.7 that the workflow pulls these three values out of an `InvestigationSummary` before calling this.
 
-**Calls out to:** nothing.
+**Calls out to:** `socket.gethostname()` (standard library).
 **Called by:** `fraud_hold_workflow.py`, `worker.py`.
 
 ---
@@ -624,7 +640,7 @@ if __name__ == "__main__":
 - **`Client.connect(...)`** — opens a connection to the Temporal *server* (a separate piece of software this project runs via Docker or `temporal server start-dev` — see `README.md`). Everything this project does with Temporal goes through a `Client` like this one.
 - **`pydantic_data_converter`** — by default, Temporal's SDK only knows how to send plain, simple data types back and forth to its server. Since this whole project passes Pydantic models (`Transaction`, `InvestigationSummary`, `CustomerResponse`) as workflow/activity/signal arguments, every `Client` in this project passes this converter so Temporal knows how to properly turn those objects into JSON and back.
 - **`plugins=[PydanticAIPlugin()]` — the piece that makes `__pydantic_ai_agents__` actually do something.** `PydanticAIPlugin`, imported from `pydantic_ai.durable_exec.temporal`, is a Temporal client/worker plugin. At the moment the `Worker` object below is constructed, it walks every workflow class listed in `workflows=[...]` (here, just `FraudHoldWorkflow`), reads each one's `__pydantic_ai_agents__` list (Section 2.7), and automatically registers the Temporal Activities each listed Agent needs — the model-request and tool-call Activities described in Section 2.6 — on this `Worker`. That's why `generate_explanation.py`'s Agent activities aren't in the `activities=[...]` list below the way `place_hold`/`notify_customer` are: this plugin adds them on its own, reading straight from the Workflow class rather than needing them listed here by hand. The plugin is passed to `Client.connect(...)`, not to `Worker(...)` directly — passing it in both places causes a duplicate-registration error.
-- **`identity=WORKER_IDENTITY`, where `WORKER_IDENTITY = f"worker-{socket.gethostname()}"`** — an ordinary `Client.connect(...)` parameter, not specific to PydanticAI. Every Activity attempt this Worker executes gets tagged with this identity string, and it's visible in Temporal's Event History (the "Identity" field on each `ActivityTaskStarted` event) and in the Temporal Web UI. `socket.gethostname()` — a standard-library call — returns this container's hostname; Docker assigns each container a distinct hostname by default, so when this project is run with `docker compose up --scale worker=2` (README's "Demo C"), the two Worker processes end up with two visibly different identities in the same workflow's Event History, without any custom instrumentation. This is the mechanism that makes it possible to tell, after the fact, *which* Worker replica actually executed a given step — including the Agent's own internal model-request/tool-call Activities, which this project's own code never directly logs a line for.
+- **`identity=WORKER_IDENTITY`, where `WORKER_IDENTITY = f"worker-{socket.gethostname()}"`** — an ordinary `Client.connect(...)` parameter, not specific to PydanticAI. Every Activity attempt this Worker executes gets tagged with this identity string, and it's visible in Temporal's Event History (the "Identity" field on each `ActivityTaskStarted` event) and in the Temporal Web UI. `socket.gethostname()` — a standard-library call — returns this container's hostname; Docker assigns each container a distinct hostname by default, so when this project is run with `docker compose up --scale worker=2` (README's "Demo C"), the two Worker processes end up with two visibly different identities in the same workflow's Event History, without any custom instrumentation. This is the mechanism that makes it possible to tell, after the fact, *which* Worker replica actually executed a given step — including the Agent's own internal model-request/tool-call Activities, most of which this project's own code never directly logs a line for (`lookup_customer_channel_preference` is the one exception — see Section 2.6 and 4.7 for why).
 - **`Worker(client, task_queue=..., workflows=[...], activities=[...])`** — this is the object that does the actual work: it repeatedly asks the Temporal server "anything for me to run?" on the given `task_queue`, and when the answer is "run `FraudHoldWorkflow`" or "run `place_hold`," it's this `Worker` object that executes the matching registered function/class — plus, now, whatever Agent activities `PydanticAIPlugin` auto-registered above.
 - **`await worker.run()`** — starts that polling loop, and doesn't return until the worker is stopped (e.g. `Ctrl+C`). This is why this process just sits there printing nothing further, once started — it's waiting for work.
 - **`if __name__ == "__main__":`** — a very common Python idiom, appearing here for the first time. `__name__` is a special variable Python sets automatically; it equals `"__main__"` only when this file is the one you *ran directly* (e.g. `python -m app.worker`), and something else when this file is merely *imported* by another file. This line means "only actually start the worker if someone ran this file directly — don't start it just because some other file imported something from it." `asyncio.run(main())` is the standard way to kick off an `async def` function from ordinary (non-async) code — every `async` chain in this project ultimately starts from a call like this one.
