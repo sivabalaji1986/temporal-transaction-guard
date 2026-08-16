@@ -130,7 +130,7 @@ The `1s backoff` in the model-request calculation above is configurable via `DEM
 
 **Hand-written side-effect Activities** (`place_hold`, `release`, `block`, `escalate`, `notify_customer`, `record_no_hold_outcome`) are separate from the Agent-phase budget above — they're not part of the 810s figure, and changing them doesn't affect it — but they also no longer rely on Temporal's default unlimited retry policy. `fraud_hold_workflow.py` gives each of them an explicit `retry_policy=_SIDE_EFFECT_RETRY_POLICY` (`maximum_attempts=2`, 1-second initial backoff), alongside their existing 10-second `start_to_close_timeout`. This bounds how long the Workflow will keep retrying a failing side effect instead of retrying it forever — it does **not** make these Activities exactly-once. Temporal Activities are at-least-once regardless of retry policy, so a real (non-mocked) downstream integration still needs its own idempotency key — e.g. `f"{transaction_id}:HOLD"` / `f"{transaction_id}:RELEASE"` / `f"{transaction_id}:BLOCK"` / `f"{transaction_id}:ESCALATE"` — bounding the retry count only stops the Workflow from waiting on a failing side effect forever, it doesn't dedupe the effect itself.
 
-If you have stale local Temporal dev-server state, wipe it (`docker compose down -v`, or don't reuse an old `temporal server start-dev` data directory) before running this project — this is a small demo repo, so a clean-slate restart is the deliberate approach rather than a production-grade versioning strategy.
+If you have stale local Temporal dev-server state, wipe it (`docker compose down -v`) before running this project — this is a small demo repo, so a clean-slate restart is the deliberate approach rather than a production-grade versioning strategy.
 
 ### How this shows up in Temporal's Event History
 
@@ -316,7 +316,7 @@ Get the repo ready to work with, and confirm it's in a working state, before run
 
    `ollama list` and the `curl` should both show `qwen3.5:latest` (or whatever you set `OLLAMA_MODEL` to) once it's pulled. If either fails to connect instead, Ollama isn't running yet — run `ollama serve` above first.
 
-7. Only after tests pass, proceed to "Running locally" below to actually run the app — that part does require Temporal, and either Docker or a native Temporal dev server.
+7. Only after tests pass, proceed to "Running locally" below to actually run the app — that part does require Temporal (via Docker) and Ollama.
 
 ---
 
@@ -326,14 +326,12 @@ Note: if you have stale local Temporal dev-server state, wipe it first — see [
 
 ### Prerequisites
 
-- Python 3.11+
-- [Ollama](https://ollama.com) running locally with a model pulled, e.g. `ollama pull qwen3.5:latest`
-- Docker (optional — see below)
-- [Temporal CLI](https://docs.temporal.io/cli#install) — required for Option B (native `temporal server start-dev`); **not** required for Option A (Docker), which bundles its own Temporal dev server
+- [Docker](https://www.docker.com/) — bundles its own Temporal dev server, so no separate Temporal CLI install is needed
+- [Ollama](https://ollama.com) running on your **host machine** (not inside Docker) with a model pulled, e.g. `ollama pull qwen3.5:latest`
 
 (See [Setup and Verification](#setup-and-verification) above if you haven't already created a virtual environment and confirmed tests pass.)
 
-### Option A: Docker (recommended)
+### Start the stack
 
 ```bash
 docker compose up --build
@@ -354,36 +352,14 @@ docker compose up --build --scale worker=2
 
 No changes to `docker-compose.yml` are needed for this — the `worker` service has no `container_name` and no fixed host port, which are the two things that would otherwise block scaling it. Each replica gets its own container hostname, which is what makes it possible to tell them apart in logs and in the Temporal Web UI's Event History (see `app/worker.py`'s `identity=`).
 
-### Option B: Run it all natively
-
-```bash
-# If you haven't already (see Setup and Verification above):
-pip install -r requirements.txt
-
-# terminal 1: start a local Temporal dev server
-temporal server start-dev
-
-# terminal 2: start the worker
-python -m app.worker
-
-# terminal 3: start the API
-uvicorn app.main:app --reload
-```
-
 ### Verify it's running
-
-**Docker (Option A):**
 
 ```bash
 docker compose ps              # temporal, api, worker should all show as Up
 docker compose logs -f worker  # look for "Worker started (worker-<hostname>), polling task queue..."
 ```
 
-Then open `http://localhost:8233` in your browser for the Temporal Web UI.
-
-**Native (Option B):**
-
-Check the worker's own terminal (terminal 2 above) for `Worker started (worker-<hostname>), polling task queue '...'`, then open `http://localhost:8233` (Temporal Web UI — `temporal server start-dev` serves this too) and `http://localhost:8000/docs` (FastAPI's interactive docs) in your browser to confirm both processes are up.
+Then open `http://localhost:8233` in your browser for the Temporal Web UI, and `http://localhost:8000/docs` for FastAPI's interactive docs.
 
 There's no `/health` endpoint on the API today — `/docs` (FastAPI's built-in Swagger UI, on by default) is the honest way to confirm it's responding without one. A dedicated health-check endpoint would be a reasonable future addition, but that's out of scope for this doc-only pass.
 
@@ -625,8 +601,11 @@ Distinguish `ActivityTaskScheduled` (a new logical step) from a second `Activity
 
 ### Stopping everything
 
-- **Docker (Option A):** `docker compose down` (add `-v` for a full reset that also wipes Temporal's dev-server data — namespaces, workflow history, everything. Only needed if you want a completely clean slate, not for routine shutdown)
-- **Native (Option B):** stop each of the three terminals with `Ctrl+C`, in any order
+```bash
+docker compose down
+```
+
+Add `-v` for a full reset that also wipes Temporal's dev-server data — namespaces, workflow history, everything. Only needed if you want a completely clean slate, not for routine shutdown.
 
 ---
 
@@ -634,9 +613,9 @@ Distinguish `ActivityTaskScheduled` (a new logical step) from a second `Activity
 
 **Ollama isn't running, or the wrong model is configured.** Every model-request Activity retries up to 2 attempts against `OLLAMA_BASE_URL`/`OLLAMA_MODEL` (from `.env`), and each tool-call Activity likewise — see [Timeout and retry budget](#timeout-and-retry-budget) above. If the Agent still can't complete after that (e.g. Ollama is unreachable for the whole investigation), the Workflow catches the resulting failure and falls back to a fixed explanation rather than failing — see the Architecture diagram above. So a broken Ollama setup won't crash a held transaction, but it will mean every hold gets the generic fallback message instead of a real explanation, and you'll see failed `agent__fraud_hold_investigator__model_request` Activity attempts in the Event History. Confirm with `ollama list` and `curl http://localhost:11434/api/tags` (see [Setup and Verification](#setup-and-verification)); double-check `OLLAMA_MODEL` in `.env` matches a model you've actually pulled.
 
-**Port already in use (`8000`, `7233`, or `8233`).** These are used by the API, the Temporal frontend service, and the Temporal Web UI respectively. Find whatever's already bound to the port (e.g. `lsof -i :8000` on Mac/Linux) and stop it, or change the mapping in `docker-compose.yml`'s `ports:` (Docker) — for native mode, `uvicorn app.main:app --port <other-port>` and `temporal server start-dev --ui-port <other-port>` accept alternate ports directly.
+**Port already in use (`8000`, `7233`, or `8233`).** These are used by the API, the Temporal frontend service, and the Temporal Web UI respectively. Find whatever's already bound to the port (e.g. `lsof -i :8000` on Mac/Linux) and stop it, or change the mapping in `docker-compose.yml`'s `ports:`.
 
-**A workflow seems stuck** (no response after `/hold`, or `/respond` doesn't seem to do anything). Start with `docker compose logs worker` (or the worker's own terminal in native mode) — every activity prints when it runs, so you can see exactly how far the workflow got. Then check the workflow's state directly in the Temporal Web UI (`http://localhost:8233`): open the workflow by its `transaction_id` and look at its event history — a workflow parked in `wait_condition` is normal and expected until a `/respond` signal (or the 24h timeout) arrives.
+**A workflow seems stuck** (no response after `/hold`, or `/respond` doesn't seem to do anything). Start with `docker compose logs worker` — every activity prints when it runs, so you can see exactly how far the workflow got. Then check the workflow's state directly in the Temporal Web UI (`http://localhost:8233`): open the workflow by its `transaction_id` and look at its event history — a workflow parked in `wait_condition` is normal and expected until a `/respond` signal (or the 24h timeout) arrives.
 
 ---
 
