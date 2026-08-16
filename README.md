@@ -1,5 +1,7 @@
 # temporal-transaction-guard
 
+[![CI](https://github.com/sivabalaji1986/temporal-transaction-guard/actions/workflows/tests.yml/badge.svg)](https://github.com/sivabalaji1986/temporal-transaction-guard/actions/workflows/tests.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Python 3.11](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/) [![Temporal](https://img.shields.io/badge/Temporal-Durable%20Execution-lightgrey.svg)](https://temporal.io/) [![PydanticAI](https://img.shields.io/badge/PydanticAI-TemporalDurability-lightgrey.svg)](https://ai.pydantic.dev/)
+
 A durable **hold → investigate → notify → wait → resolve** workflow for suspicious transactions, built on [Temporal](https://temporal.io), [FastAPI](https://fastapi.tiangolo.com), a tool-using [PydanticAI](https://ai.pydantic.dev) Agent running through PydanticAI's `TemporalDurability` capability, and a local [Ollama](https://ollama.com) model.
 
 This README covers install/run/demo instructions. For a from-scratch, file-by-file walkthrough of how the code works (aimed at readers new to Python or this codebase), see [`docs/LEARNING_GUIDE.md`](docs/LEARNING_GUIDE.md).
