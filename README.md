@@ -469,7 +469,7 @@ These prove three distinct, related properties. Don't conflate them:
 | | Proves | How |
 |---|---|---|
 | **Demo A** | The *business Workflow* survives a Worker crash while durably waiting for a customer. | Manual, below. |
-| **Demo B** | Model/tool steps *inside* one Agent investigation are individually durable — a completed one isn't redone just because a later one fails. | Automated test (deterministic, reproducible on every run) + a manual Event-History inspection. |
+| **Demo B** | Model/tool steps *inside* one Agent investigation are individually durable — a completed one isn't redone just because a later one fails. | Manual, using the Event History / Timeline in the Web UI. |
 | **Demo C** | An in-flight Agent Activity survives a *different* Worker container being terminated mid-execution — not just a restart — and retries on a surviving replica; work already completed before the interruption is preserved. | Manual, using two Docker Worker replicas. |
 
 Taken together: Temporal keeps the business Workflow durable across Worker failure and gives PydanticAI model/tool calls durable Activity boundaries. Completed Activities are preserved in history, while incomplete Activities can retry on another Worker.
@@ -498,15 +498,9 @@ This is a stronger proof than merely restarting a worker while it's still pollin
 
 ### Demo B — Fine-grained Agent durability
 
-The authoritative, reproducible proof of this property is the automated test `tests/test_generate_explanation_agent_durability.py::test_completed_tool_activity_is_not_reexecuted_on_later_failure` — it deterministically scripts a tool call succeeding, then the *next* model turn failing once and retrying, and verifies (via both a Python invocation counter and Temporal's own Event History `ActivityTaskScheduled` counts) that the tool was invoked exactly once despite the retry:
+Fire the `hold` curl example above, then open the workflow's **Event History** in the Web UI (`http://localhost:8233`). You'll see the investigation broken into several separate Activity Task entries — `agent__fraud_hold_investigator__model_request` (once per model turn) and `agent__fraud_hold_investigator__toolset__<agent>__call_tool` (once per tool call actually made) — each independently scheduled, started, and completed. Each of those is its own durability checkpoint, recorded by the Temporal server the moment it completes, regardless of what happens afterward.
 
-```bash
-pytest tests/test_generate_explanation_agent_durability.py -v
-```
-
-To see the underlying mechanism live against a real hold: fire the `hold` curl example above, then open the workflow's **Event History** in the Web UI (`http://localhost:8233`). You'll see the investigation broken into several separate Activity Task entries — `agent__fraud_hold_investigator__model_request` (once per model turn) and `agent__fraud_hold_investigator__toolset__<agent>__call_tool` (once per tool call actually made) — each independently scheduled, started, and completed. That's what makes the automated test's property possible: each of those is its own durability checkpoint, recorded by the Temporal server the moment it completes, regardless of what happens afterward.
-
-**Live demo, catching a real retry:** the automated test above is deterministic and doesn't depend on real Ollama timing — it's the reproducible proof. This live version shows the same property against a genuine investigation, but it depends on a model-request Activity actually failing on its first attempt (e.g. a real Ollama connection hiccup), which doesn't happen on every run. `DEMO_MODEL_RETRY_INTERVAL_SECONDS` doesn't force that failure — it only widens the backoff *if* one occurs, so a retry stays visible in the Web UI for longer than the 1-second default gives you. Set it, temporarily, in `.env` before bringing the stack up (or export it before `docker compose up`):
+**Live demo, catching a real retry:** this depends on a model-request Activity actually failing on its first attempt (e.g. a real Ollama connection hiccup), which doesn't happen on every run. `DEMO_MODEL_RETRY_INTERVAL_SECONDS` doesn't force that failure — it only widens the backoff *if* one occurs, so a retry stays visible in the Web UI for longer than the 1-second default gives you. Set it, temporarily, in `.env` before bringing the stack up (or export it before `docker compose up`):
 
 ```env
 DEMO_MODEL_RETRY_INTERVAL_SECONDS=20
@@ -539,7 +533,7 @@ later model request attempt 2       ✅
 
 *Demo B — Retry of the same model-request Activity. Temporal shows `Attempt: 2` together with the previous model-call failure, followed by successful completion. The retry occurs at the failed model-request boundary rather than restarting the entire Agent investigation.*
 
-The property on display is the same one the automated test proves precisely: only the failed model-request Activity retries. `place_hold`, `lookup_recent_transactions`, and `lookup_customer_channel_preference` all stay completed exactly once — they are not re-executed just because a later step failed.
+Only the failed model-request Activity retries. `place_hold`, `lookup_recent_transactions`, and `lookup_customer_channel_preference` all stay completed exactly once — they are not re-executed just because a later step failed.
 
 **Reset `DEMO_MODEL_RETRY_INTERVAL_SECONDS` to `1`** before using this stack for anything other than this specific demo.
 
