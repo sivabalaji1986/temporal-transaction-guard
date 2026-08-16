@@ -500,7 +500,7 @@ This is a stronger proof than merely restarting a worker while it's still pollin
 
 Fire the `hold` curl example above, then open the workflow's **Event History** in the Web UI (`http://localhost:8233`). You'll see the investigation broken into several separate Activity Task entries — `agent__fraud_hold_investigator__model_request` (once per model turn) and `agent__fraud_hold_investigator__toolset__<agent>__call_tool` (once per tool call actually made) — each independently scheduled, started, and completed. Each of those is its own durability checkpoint, recorded by the Temporal server the moment it completes, regardless of what happens afterward.
 
-**Live demo, catching a real retry:** this depends on a model-request Activity actually failing on its first attempt (e.g. a real Ollama connection hiccup), which doesn't happen on every run. `DEMO_MODEL_RETRY_INTERVAL_SECONDS` doesn't force that failure — it only widens the backoff *if* one occurs, so a retry stays visible in the Web UI for longer than the 1-second default gives you. Set it, temporarily, in `.env` before bringing the stack up (or export it before `docker compose up`):
+**Live demo, triggering a deliberate retry:** rather than waiting for a random Ollama connection hiccup, this demo deliberately stops the local Ollama server between the first and second model-request Activities, so the retry is reproducible on every run. `DEMO_MODEL_RETRY_INTERVAL_SECONDS` widens the retry backoff so you have a comfortable window to restart Ollama before the retry fires. Set it, temporarily, in `.env` before bringing the stack up (or export it before `docker compose up`):
 
 ```env
 DEMO_MODEL_RETRY_INTERVAL_SECONDS=20
@@ -514,15 +514,30 @@ docker compose exec worker python -c "from app.config import settings; print(set
 docker compose exec worker python -c "from app.activities.generate_explanation import _MODEL_ACTIVITY_CONFIG; print(_MODEL_ACTIVITY_CONFIG)"
 ```
 
-Fire the `hold` curl example and watch the workflow's **Timeline** in the Web UI. A run where the second model-request Activity happens to fail once looks like this:
+With that confirmed, fire the `hold` curl example and watch the workflow's **Timeline** in the Web UI:
+
+1. Let `Model request 1` and both read-only tool Activities (`lookup_recent_transactions`, `lookup_customer_channel_preference`) complete.
+2. As soon as `lookup_customer_channel_preference` shows completed, stop Ollama (see below) — before the next, later model-request Activity starts.
+3. Confirm that later model-request Activity's attempt 1 fails, with `Last Failure` showing a connection error.
+4. While the workflow sits in its 20-second retry backoff, restart Ollama (see below).
+5. Confirm attempt 2 of that same Activity succeeds.
+6. Confirm `Model request 1`, `lookup_recent_transactions`, and `lookup_customer_channel_preference` still show completed exactly once — none of them re-ran just because the later Activity failed and retried.
+
+**Stopping/restarting Ollama** (it runs on your host machine, not inside Docker — see [Running locally](#running-locally)) is OS-dependent:
+
+- **macOS/Windows desktop app:** quit Ollama from the menu bar / system tray icon, then reopen it. Don't use `ollama stop qwen3.5:latest` (or any `ollama stop <model>`) — that only unloads the model from memory and leaves the Ollama API server itself running, so the Activity would keep succeeding.
+- **Linux, systemd install:** `sudo systemctl stop ollama` / `sudo systemctl start ollama`.
+- **Started manually with `ollama serve`:** stop that process (`Ctrl+C` in its terminal), then run `ollama serve` again.
+
+This is what the deliberate failure looks like in the Timeline:
 
 ```text
 Model request 1                     ✅
 lookup_recent_transactions          ✅
 lookup_customer_channel_preference  ✅
-later model request attempt 1       ❌
-        ↓ retry backoff
-later model request attempt 2       ✅
+later model request attempt 1       ❌ (Ollama stopped)
+        ↓ retry backoff (20s)
+later model request attempt 2       ✅ (Ollama restarted)
 ```
 
 ![Demo B - Fine-grained Agent retry in Timeline](screenshots/demob_1.png)
@@ -539,7 +554,7 @@ Only the failed model-request Activity retries. `place_hold`, `lookup_recent_tra
 
 ### Demo C — Cross-Worker failover during durable Agent execution
 
-Proves cross-Worker failover for an in-flight Agent Activity: when the Worker container executing it is terminated mid-execution — not just restarted (Demo A) — a *different*, surviving Worker container picks up the retry, using two Worker replicas polling the same task queue. Everything that completed *before* the interruption (here, the first model turn and the first tool call) is preserved from Event History rather than redone. This is related to, but distinct from, Demo B's specific claim: Demo B automatedly proves a completed *tool* Activity survives a *later model* Activity failing and retrying, all on one Worker; Demo C proves an in-flight Activity itself can resume on *another* Worker after the original one is killed. Don't read Demo C as re-proving Demo B's exact scenario — it demonstrates the cross-Worker failover property specifically.
+Proves cross-Worker failover for an in-flight Agent Activity: when the Worker container executing it is terminated mid-execution — not just restarted (Demo A) — a *different*, surviving Worker container picks up the retry, using two Worker replicas polling the same task queue. Everything that completed *before* the interruption (here, the first model turn and the first tool call) is preserved from Event History rather than redone. This is related to, but distinct from, Demo B's specific claim: Demo B manually demonstrates a completed *tool* Activity surviving a *later model* Activity failing and retrying, all on one Worker; Demo C proves an in-flight Activity itself can resume on *another* Worker after the original one is killed. Don't read Demo C as re-proving Demo B's exact scenario — it demonstrates the cross-Worker failover property specifically.
 
 **Setup:**
 
