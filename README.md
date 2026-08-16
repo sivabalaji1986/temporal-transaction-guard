@@ -569,16 +569,25 @@ Each replica logs its own container hostname on startup (`Worker started (worker
 
 **Make the interruption window reproducible**, rather than racing a live Ollama call's variable timing: set `DEMO_FAILOVER_DELAY_SECONDS=8` in `.env` before `docker compose up`. This adds a plain `asyncio.sleep(8)` inside the `lookup_customer_channel_preference` tool — the *second* of the Agent's two read-only tools, which the Agent typically calls in the same turn as the first — giving you a predictable window to identify and kill a Worker while a real Activity is genuinely in-flight. `8` is deliberately below the tool-call Activity's 10-second `start_to_close_timeout` (see [Timeout and retry budget](#timeout-and-retry-budget)): with the Worker left running normally, the delayed call still completes before its timeout and the Agent continues normally — the delay creates an interruption window, it doesn't force a timeout. Setting it above `10` would instead guarantee the Activity times out on its own, driving the Agent into its deterministic fallback regardless of whether a Worker is ever killed, which is not what this demo is meant to show. It's `0` (off) by default everywhere else, including every automated test, and it only ever delays this one already-read-only, already-idempotent Activity — it doesn't touch Workflow code, `customer_id` handling, or bypass `TemporalDurability` in any way.
 
-> **Honest note on scope:** the interrupted/retried Activity in this reproducible demo is the second **tool** call, not the second **model** request. Delaying a specific model-request Activity would require patching PydanticAI's internal activity functions — private API, which this project deliberately avoids (see `AGENTS.md`). Delaying our own tool achieves the same underlying property with only public, documented mechanisms: an in-flight Activity survives a Worker death, and whatever completed *before* it (here, the first model turn and the first tool call) is preserved and not re-executed.
+> **Honest note on scope:** the interrupted/retried Activity in this reproducible demo is the second **tool** call, not the second **model** request. Delaying a specific model-request Activity would require patching PydanticAI's internal activity functions — private API, which this project deliberately avoids (see `AGENTS.md`). Delaying our own tool achieves the same underlying property with only public, documented mechanisms: an in-flight Agent Activity can recover from Worker death — the interrupted attempt does not complete, and Temporal retries the same logical Activity on another Worker — and whatever completed *before* it (here, the first model turn and the first tool call) is preserved and not re-executed.
 
 **Sequence:**
 
 1. Fire the `hold` curl example (above) with a fraud score at/above the threshold.
 2. Watch the Worker logs (`docker compose logs -f --timestamps worker`): confirm `agent__fraud_hold_investigator__model_request` (turn 1) and `agent__fraud_hold_investigator__toolset__<agent>__call_tool` for `lookup_recent_transactions` have both completed (you can cross-check this in the Web UI's Event History too), then wait for a `[tool:<hostname>] lookup_customer_channel_preference START attempt=1 customer=...` log line — its hostname is "Worker A."
-3. Kill Worker A specifically: `docker compose stop <the container name shown in the log line>` (find it with `docker compose ps`).
+3. Stop Worker A specifically: `docker stop <worker-container-name>` — find the exact container name with `docker compose ps`. Use plain `docker stop`, not `docker compose stop`: Compose's `stop` targets a *service* (all its replicas), so `docker compose stop worker` would stop both Worker A and Worker B; `docker stop` takes a specific container name/ID, so it stops only the one replica you name.
 4. Watch the logs: Worker B (the surviving replica) picks up the retry — a second `[tool:<hostname>] lookup_customer_channel_preference START attempt=2 customer=...` line appears, this time with Worker B's hostname, followed by its `COMPLETE` line. The Agent continues to its final model turn, which also runs on whichever Worker is free (commonly B).
 5. The investigation completes normally: `InvestigationSummary` produced, customer notified, workflow durably waiting again.
 6. Send the `respond` curl example — the workflow resolves (`release`/`block`) exactly as in Demo A.
+
+```text
+Worker A executes attempt 1
+        ↓ Worker A is stopped
+        ↓ attempt 1 does not complete
+        ↓ Temporal records the failed/timed-out attempt
+        ↓ the same logical Activity becomes retry-eligible
+Worker B executes attempt 2
+```
 
 ![Demo C - Cross-Worker retry in Temporal](screenshots/democ_1.png)
 
@@ -606,7 +615,7 @@ Each replica logs its own container hostname on startup (`Worker started (worker
 
 Distinguish `ActivityTaskScheduled` (a new logical step) from a second `ActivityTaskStarted` under the *same* schedule (a retry of that same step) — conflating them would make it look like more work happened than actually did.
 
-**What this does and doesn't prove:** Worker B reconstructs the Workflow/Agent orchestration from Temporal's Event History — completed model/tool Activity results are reused from that history, while the interrupted Activity is retried. This is **not** Python process memory moving from Worker A to Worker B, and it is **not** recovery of any hidden or token-level model reasoning state — the durable recovery boundary is exactly the recorded Activity result, nothing more granular than that.
+**What this does and doesn't prove:** Temporal preserves the Workflow's durable history. Worker B executes the retry of the interrupted Activity. When subsequent Workflow Tasks run, Workflow/Agent orchestration is reconstructed through replay from Event History, with already-completed Activity results supplied from history. This is **not** Python process memory moving from Worker A to Worker B, and it is **not** recovery of any hidden or token-level model reasoning state — the durable recovery boundary is exactly the recorded Activity result, nothing more granular than that.
 
 **Unset `DEMO_FAILOVER_DELAY_SECONDS`** (or set it back to `0`) before using this stack for anything other than this specific demo.
 
