@@ -395,7 +395,7 @@ Response:
 {"workflow_id":"TXN-1001","status":"started"}
 ```
 
-Simulate the customer's reply:
+Simulate the customer's reply (after notify_customer activity is executed):
 
 ```bash
 curl -X POST http://localhost:8000/transactions/TXN-1001/respond \
@@ -480,10 +480,10 @@ Taken together: Temporal keeps the business Workflow durable across Worker failu
 2. Submit an above-threshold transaction (the `hold` curl example above).
 3. Let `place_hold`, the Agent investigation, and `notify_customer` complete.
 4. Confirm in the Temporal Web UI (`http://localhost:8233`) that the workflow is now durably waiting for the customer response — see [How this shows up in Temporal's Event History](#how-this-shows-up-in-temporals-event-history) above for how to read it.
-5. Stop the worker (`Ctrl+C` or `docker compose stop worker`) — and leave it down.
+5. Stop the worker (`docker compose stop worker`) — and leave it down.
 6. While the worker is still down, send the customer response (the `respond` curl example above).
 7. In the Web UI, confirm Temporal accepted and recorded the Signal, and that the workflow's status is still **Running**, not failed. You'll typically see a **Workflow Task Timed Out** event with `Timeout Type: TIMEOUT_TYPE_SCHEDULE_TO_START` — this is a *Workflow Task* timeout (no worker was available to pick up the next decision), not a Workflow execution failure. Temporal can accept and durably record a Signal even with zero workers running; nothing about the workflow's recorded state is affected by there being no worker to act on it yet.
-8. Restart the worker.
+8. Start the worker (`docker compose start worker`).
 9. Watch the workflow resume: once a worker is available again, Temporal delivers the already-recorded history and Signal to it, the workflow replays/continues from exactly where it left off, cancels the wait timer, runs the resolution activity (`release`/`block`), and completes.
 
 ![Demo A - Workflow remains running while Worker is unavailable](screenshots/demoa_1.png)
